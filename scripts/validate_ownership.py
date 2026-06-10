@@ -12,11 +12,31 @@ DESIGN (positive-signal-only):
   to "keep" let squatter brand-look-alike domains waste hours of a real scan.
 
   The new model requires AFFIRMATIVE proof of ownership. Signals (any one wins):
-    1. RDAP registrant org name matches --org-aliases  (strongest)
-    2. TLS cert subject.O matches --org-aliases        (strong)
-    3. HTTP redirect to a known-owned brand domain      (strong)
-    4. NS matches --trusted-ns-pattern (e.g. awsdns-)   (medium — narrow allowlist)
-    5. Brand label exact-match + live serving content   (weak; legacy heuristic)
+    1. RDAP registrant org name matches --org-aliases   (strongest)
+    2. TLS cert SAN intersects a trusted root           (strongest — see note)
+    3. TLS cert subject.O matches --org-aliases         (strong)
+    4. HTTP redirect to a known-owned brand domain      (strong)
+    5. Soft-redirect body anchor/meta-refresh to brand  (strong — see note)
+    6. NS matches --trusted-ns-pattern (e.g. awsdns-)   (medium — narrow allowlist)
+    7. Brand label exact-match + live serving content   (weak; legacy heuristic)
+
+  Note on (2) Cert SAN intersection:
+    AWS ACM and most cloud TLS pipelines issue a single multi-SAN cert per
+    service and present it across every domain that points at that ALB/CDN.
+    If candidate `acme.io` serves a cert whose SAN list contains `*.acme.com`,
+    that's cryptographic shared-issuance proof — the same ACM cert + private key
+    is being served, which means same AWS account / same owner. We extract SANs
+    via cryptography.x509 because ssl.getpeercert() returns {} under CERT_NONE.
+
+  Note on (5) Soft-redirect body:
+    A correctly-configured redirect uses HTTP 3xx + Location header (caught by
+    signal 4). But misconfigured services return HTTP 200 with a body like
+    `<a href="https://acme.com">Found</a>.` (Express's default redirect
+    body when status is overridden), or `<meta http-equiv="refresh" ...>`,
+    or `<script>window.location='...'</script>`. httpx's -location flag sees
+    none of these. We do a small body-fetch + regex parse and treat a sole
+    cross-origin anchor / meta-refresh / window.location pointing to a trusted
+    brand the same as a real 3xx redirect.
 
   Without ANY positive signal → REJECTED (default). Pass --include-uncertain
   to restore the old "include unjudged domains in enumeration" behavior.
@@ -48,6 +68,17 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
+
+# cryptography is required for cert SAN parsing — getpeercert() returns {}
+# when verify_mode=CERT_NONE, so the stdlib parser is unusable for unverified
+# cert inspection. Imported lazily so the script still loads if the user
+# hasn't installed it; the SAN signal degrades gracefully (logs a warning).
+try:
+    from cryptography import x509
+    from cryptography.x509.oid import ExtensionOID, NameOID
+    _HAVE_CRYPTOGRAPHY = True
+except ImportError:
+    _HAVE_CRYPTOGRAPHY = False
 
 # Bound raw DNS lookups so a hung resolver can't wedge a pool worker.
 socket.setdefaulttimeout(8)
@@ -240,8 +271,13 @@ def http_meta(domains, timeout=10):
             f.write("\n".join(domains))
             tmp = f.name
         try:
+            # -fr: follow up to 10 redirects. Without this, only the first-hop
+            # Location header is captured; a chain like apex → www → app is
+            # truncated. The 'url' field then carries the FINAL URL, which is
+            # what we want to compare against owned roots.
             r = subprocess.run([httpx, "-l", tmp, "-json", "-silent",
                                 "-status-code", "-title", "-location",
+                                "-fr", "-maxr", "5",
                                 "-timeout", str(timeout), "-threads", "50"],
                                capture_output=True, text=True,
                                timeout=max(120, len(domains)))
@@ -367,38 +403,143 @@ def rdap_lookup(domains):
     return out
 
 
-# ── TLS cert organisation lookup ─────────────────────────────────────────────
-def _cert_org_one(domain, timeout=6):
-    """Return the cert subject's Organization (O) field, lowercased, or ""."""
+# ── TLS cert organisation + SAN lookup ───────────────────────────────────────
+# We always grab the cert in BINARY form because ssl.getpeercert() returns {}
+# whenever verify_mode is CERT_NONE — and we MUST keep CERT_NONE because we're
+# inspecting potentially-untrusted hosts where the chain doesn't necessarily
+# validate. Parsing with cryptography.x509 gives us full access to Subject.O
+# AND SubjectAltName, both of which are positive ownership signals.
+def _cert_info_one(domain, timeout=6):
+    """Return (subject_O_lower, [san_dnsnames_lower], fingerprint_sha256_hex).
+
+    Always uses binary form so we get the actual certificate regardless of
+    verification state. Cert-parsing failures return empty fields.
+    """
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE  # we just want the cert, not to validate
+    ctx.verify_mode = ssl.CERT_NONE
     try:
         with socket.create_connection((domain, 443), timeout=timeout) as sock:
             with ctx.wrap_socket(sock, server_hostname=domain) as ssock:
-                cert = ssock.getpeercert()
+                der = ssock.getpeercert(binary_form=True)
     except (socket.timeout, socket.gaierror, ConnectionError, ssl.SSLError, OSError):
-        return ""
-    subject = dict(x[0] for x in cert.get("subject", ()) if x)
-    return (subject.get("organizationName") or "").lower().strip()
+        return "", [], ""
+    if not der or not _HAVE_CRYPTOGRAPHY:
+        return "", [], ""
+    try:
+        cert = x509.load_der_x509_certificate(der)
+        o_attrs = cert.subject.get_attributes_for_oid(NameOID.ORGANIZATION_NAME)
+        org = (o_attrs[0].value.lower().strip() if o_attrs else "")
+        try:
+            ext = cert.extensions.get_extension_for_oid(
+                ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
+            sans = [s.lower() for s in ext.value.get_values_for_type(x509.DNSName)]
+        except x509.ExtensionNotFound:
+            sans = []
+        # Cert fingerprint can identify "same ACM cert served on two domains"
+        # — a hash-equality match is even stronger than SAN intersection.
+        try:
+            from cryptography.hazmat.primitives import hashes
+            fp = cert.fingerprint(hashes.SHA256()).hex()
+        except Exception:
+            fp = ""
+        return org, sans, fp
+    except Exception:
+        return "", [], ""
 
 
-def cert_org_lookup(domains, timeout=6):
-    """{apex: cert_subject_O_lowercased} for HTTPS-reachable domains."""
+def cert_info_lookup(domains, timeout=6):
+    """{apex: (subject_O_lower, [sans_lower], fingerprint_sha256_hex)}."""
     domains = sorted({d.strip().lower() for d in domains if d.strip()})
     out = {}
     if not domains:
         return out
     with ThreadPoolExecutor(max_workers=max(1, min(40, len(domains)))) as pool:
-        futs = {pool.submit(_cert_org_one, d, timeout): d for d in domains}
+        futs = {pool.submit(_cert_info_one, d, timeout): d for d in domains}
         for f in as_completed(futs):
             d = futs[f]
             try:
-                org = f.result()
+                info = f.result()
             except Exception:
-                org = ""
-            if org:
-                out[d] = org
+                info = ("", [], "")
+            org, sans, fp = info
+            if org or sans or fp:
+                out[d] = info
+    return out
+
+
+def _san_matches_trusted(sans, trusted_roots):
+    """Return the matching SAN string if any SAN's apex equals a trusted root
+    (or is a subdomain of one). Strips leading wildcards."""
+    if not sans or not trusted_roots:
+        return ""
+    troots = set(trusted_roots)
+    for s in sans:
+        bare = s.lstrip("*.").lower().rstrip(".")
+        if not bare or "." not in bare:
+            continue
+        for t in troots:
+            if bare == t or bare.endswith("." + t):
+                return s
+    return ""
+
+
+# ── HTTP body inspection for soft redirects ──────────────────────────────────
+# Some misconfigured services return HTTP 200 with a body that's effectively
+# a redirect — Express.js does this when the developer overrides the status,
+# leaving the default body `<a href="https://target">Found</a>.`. Other forms:
+#   <meta http-equiv="refresh" content="0; url=https://target">
+#   <script>window.location.href='https://target'</script>
+# None of these are visible to httpx's -location flag. We re-fetch a small
+# slice of the body and pull out the first cross-origin URL via regex.
+_META_REFRESH_RE = re.compile(
+    r'<meta[^>]+http-equiv\s*=\s*["\']?refresh["\']?[^>]+url\s*=\s*["\']?'
+    r'(https?://[^"\'\s>]+)', re.I)
+_JS_LOCATION_RE = re.compile(
+    r'(?:window\.location(?:\.href)?|location\.href|location\.replace\([\s]*)'
+    r'\s*=?\s*["\']?(https?://[^"\'\s)]+)', re.I)
+_ANCHOR_FOUND_RE = re.compile(
+    r'<a\s+href\s*=\s*["\'](https?://[^"\'\s>]+)["\'][^>]*>\s*Found\s*</a>',
+    re.I)
+
+
+def _body_redirect_target(domain, timeout=6):
+    """Fetch up to 16KB of the apex body and return the first cross-origin URL
+    encoded as a soft redirect (meta-refresh, JS window.location, or the
+    Express-default 'Found' anchor). Empty string if nothing matches.
+    """
+    for scheme in ("https", "http"):
+        try:
+            req = Request(f"{scheme}://{domain}",
+                          headers={"User-Agent": "Mozilla/5.0 (recon/ownership)"})
+            with urlopen(req, timeout=timeout) as resp:
+                body = resp.read(16384).decode("utf-8", "ignore")
+        except (URLError, HTTPError, socket.timeout, OSError, ValueError):
+            continue
+        for rx in (_META_REFRESH_RE, _JS_LOCATION_RE, _ANCHOR_FOUND_RE):
+            m = rx.search(body)
+            if m:
+                return m.group(1)
+        # Fall-through: nothing matched on this scheme; try the other.
+    return ""
+
+
+def body_redirect_lookup(domains, timeout=6):
+    """{apex: redirect_target_host} for domains with a body-level soft redirect."""
+    domains = sorted({d.strip().lower() for d in domains if d.strip()})
+    out = {}
+    if not domains:
+        return out
+    with ThreadPoolExecutor(max_workers=max(1, min(40, len(domains)))) as pool:
+        futs = {pool.submit(_body_redirect_target, d, timeout): d for d in domains}
+        for f in as_completed(futs):
+            d = futs[f]
+            try:
+                target = f.result()
+            except Exception:
+                target = ""
+            if target:
+                out[d] = _url_host(target)
     return out
 
 
@@ -439,8 +580,9 @@ def _org_is_squatter(org_string):
 
 # ── Classification — positive-signal-only ─────────────────────────────────────
 def classify_root(apex, owned_roots, owned_labels, org_aliases,
-                  trusted_ns_re, trusted_ns_set,
-                  ns_map, http_map, a_map, rdap_map, cert_map):
+                  trusted_ns_re, trusted_ns_set, trusted_cert_fps,
+                  ns_map, http_map, a_map, rdap_map, cert_map,
+                  body_redirect_map):
     """Decide owned / rejected / uncertain for one root.
 
     Returns (status, reason). With positive-signal-only policy, "uncertain"
@@ -452,7 +594,9 @@ def classify_root(apex, owned_roots, owned_labels, org_aliases,
     status, redirect, title = http_map.get(apex, (None, "", ""))
     ips = a_map.get(apex, [])
     registrant = rdap_map.get(apex, "")
-    cert_o = cert_map.get(apex, "")
+    cert_info = cert_map.get(apex, ("", [], ""))
+    cert_o, cert_sans, cert_fp = cert_info
+    body_redirect = body_redirect_map.get(apex, "")
 
     # === Hard rejects (cheap, run first) ===
     parker = _is_parking_ns(ns)
@@ -465,7 +609,20 @@ def classify_root(apex, owned_roots, owned_labels, org_aliases,
     if sq:
         return "rejected", f"registrant is squatter/broker ({sq!r} in {registrant!r})"
 
-    # === Strong positive signals — RDAP / TLS cert ===
+    # === Strongest positive — TLS cert SAN intersects a trusted root ===
+    # AWS ACM / Let's Encrypt multi-SAN certs are issued once and served on
+    # every domain in the SAN list. If candidate `acme.io` serves a cert whose
+    # SAN list contains `*.acme.com`, the same cert+key is being served
+    # → same AWS account / same TLS pipeline → same owner. Works even when
+    # Subject.O is empty (ACM leaf certs have O=Amazon, not the customer) and
+    # RDAP fails (common on .io/.in/.tech TLDs).
+    san_hit = _san_matches_trusted(cert_sans, owned_roots)
+    if san_hit:
+        return "owned", f"TLS cert SAN includes trusted root ({san_hit})"
+    if cert_fp and cert_fp in trusted_cert_fps:
+        return "owned", f"TLS cert fingerprint matches a trusted root cert (sha256 {cert_fp[:16]}…)"
+
+    # === Strong positive signals — RDAP / TLS cert subject.O ===
     if registrant:
         m = _org_matches_aliases(registrant, org_aliases)
         if m:
@@ -475,7 +632,7 @@ def classify_root(apex, owned_roots, owned_labels, org_aliases,
         if m:
             return "owned", f"TLS cert subject.O matches '{m}' (O={cert_o!r})"
 
-    # === Strong positive — HTTP redirect to owned brand ===
+    # === Strong positive — HTTP redirect to owned brand (real 3xx) ===
     if redirect:
         rlabel = redirect.split(".")[0]
         for r in sorted(owned_roots, key=len, reverse=True):
@@ -483,6 +640,19 @@ def classify_root(apex, owned_roots, owned_labels, org_aliases,
                 return "owned", f"HTTP redirect to owned domain {r}"
         if rlabel in owned_labels:
             return "owned", f"HTTP redirect to brand domain {redirect}"
+
+    # === Strong positive — soft redirect in body (200 + anchor/meta/JS) ===
+    # Misconfigured services return 200 with an HTML body that's effectively
+    # a redirect — Express's `<a href="...">Found</a>.`, <meta refresh>, or
+    # window.location.href. httpx doesn't see these; we do a small body fetch
+    # in body_redirect_lookup. Treat the target the same as a real 3xx.
+    if body_redirect:
+        rlabel = body_redirect.split(".")[0]
+        for r in sorted(owned_roots, key=len, reverse=True):
+            if body_redirect == r or body_redirect.endswith("." + r):
+                return "owned", f"body soft-redirect to owned domain {r}"
+        if rlabel in owned_labels:
+            return "owned", f"body soft-redirect to brand domain {body_redirect}"
 
     # === Strong positive — NS overlaps the trusted set's nameservers ===
     # For Route 53, each AWS hosted zone gets a unique 4-NS delegation set;
@@ -590,13 +760,37 @@ def main():
             print(f"[*] Derived {len(trusted_ns_set)} trusted nameserver(s) "
                   f"from --trusted: {sorted(trusted_ns_set)[:3]}…", flush=True)
 
+    # Derive the trusted-cert-fingerprint set from --trusted domains too.
+    # If a candidate root presents a cert whose SHA-256 fingerprint matches a
+    # trusted-root cert, they're literally serving the same ACM cert (same
+    # private key) → unambiguous shared ownership.
+    trusted_cert_fps = set()
+    if trusted and _HAVE_CRYPTOGRAPHY:
+        trusted_cert_map = cert_info_lookup(sorted(trusted),
+                                            timeout=min(args.timeout, 6))
+        for d, (_o, _sans, fp) in trusted_cert_map.items():
+            if fp:
+                trusted_cert_fps.add(fp)
+        if trusted_cert_fps:
+            print(f"[*] Derived {len(trusted_cert_fps)} trusted cert "
+                  f"fingerprint(s) from --trusted", flush=True)
+    elif not _HAVE_CRYPTOGRAPHY:
+        print("[!] WARNING: cryptography module not installed — cert SAN and "
+              "fingerprint signals disabled. `pip install cryptography` to "
+              "enable. (You'll miss roots like acme.io that only carry the "
+              "ownership signal in their cert SANs.)", flush=True)
+
     ns_map = ns_lookup(to_check)
     http_map = http_meta(to_check, args.timeout)
     a_map = a_lookup(to_check)
     print(f"[*] RDAP registrant lookups ({len(to_check)} domains)…", flush=True)
     rdap_map = rdap_lookup(to_check)
-    print(f"[*] TLS cert subject.O lookups…", flush=True)
-    cert_map = cert_org_lookup(to_check, timeout=min(args.timeout, 6))
+    print(f"[*] TLS cert (subject.O + SAN + fingerprint) lookups…", flush=True)
+    cert_map = cert_info_lookup(to_check, timeout=min(args.timeout, 6))
+    print(f"[*] HTTP body soft-redirect inspection (meta-refresh / JS / "
+          f"<a>Found</a>)…", flush=True)
+    body_redirect_map = body_redirect_lookup(to_check,
+                                             timeout=min(args.timeout, 6))
 
     owned_roots = set(trusted)
     owned_labels = set(slugs)
@@ -608,8 +802,10 @@ def main():
     for r in to_check:
         status, reason = classify_root(r, owned_roots, owned_labels, org_aliases,
                                        trusted_ns_re, trusted_ns_set,
+                                       trusted_cert_fps,
                                        ns_map, http_map, a_map,
-                                       rdap_map, cert_map)
+                                       rdap_map, cert_map,
+                                       body_redirect_map)
         bucket[status][r] = reason
         if args.verbose:
             print(f"  [{status:9}] {r:<22} {reason}", flush=True)
