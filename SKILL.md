@@ -1,7 +1,6 @@
 ---
 name: subdomain-recon
-owner: Krutarth Shukla
-email: krutarth.ce@gmail.com
+Author: Krutarth Shukla
 description: >
   Automated subdomain & domain reconnaissance. The user gives ONLY an org name
   or one/more domains; the skill discovers owned root domains (including

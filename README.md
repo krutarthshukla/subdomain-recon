@@ -4,6 +4,18 @@ Give it an organisation name — or just a domain or two — and it maps out the
 
 In practice it tends to surface noticeably more than running `subfinder` or `amass` on their own, mostly because it doesn't stop at certificate transparency — it also pivots on favicons, TLS certs, source maps, ASN ranges, and a few ML and brute-force passes.
 
+## How to use it
+
+This is a Claude Code skill, so the easiest way to run it is to just ask, in plain English:
+
+- `recon acme.com`
+- `find all subdomains of Acme`
+- `map the attack surface of acme.com, acme.io`
+
+Give it an **org name** and it discovers and validates the owned root domains first; give it one or more **domains** and it enumerates those directly. You don't choose a mode — it's detected from what you type. The first run on a new machine installs the toolchain automatically (a few minutes, one time), and every run drops a self-contained folder under `~/Desktop/`.
+
+Prefer the terminal? The same thing runs as a single command — see [Quick start](#quick-start) below.
+
 ## What it does
 
 - **Finds the root domains, not just subdomains.** Starts from the org name and expands into acquisitions, brand domains, and ccTLD variants. It also keeps domains that only have NS records (no A record), which a naive sweep would throw away.
@@ -266,4 +278,4 @@ Only run this against assets you own or have explicit permission to test. Scanni
 
 ## Author
 
-Krutarth Shukla · krutarth.ce@gmail.com
+Krutarth Shukla
