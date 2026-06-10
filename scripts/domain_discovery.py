@@ -49,12 +49,15 @@ TLDS = [
     "com", "net", "org", "io", "co", "ai",
     # Country codes with heavy commercial use (global, not region-biased)
     "us", "uk", "de", "fr", "ca", "au", "br", "nl", "jp", "in",
+    "es", "it", "se", "ch", "sg", "ae", "sa", "id", "mx", "ru", "pl", "tr", "za",
     # Modern tech/startup TLDs
     "app", "dev", "tech", "cloud", "digital",
     # Business/commerce
     "store", "shop", "online", "biz", "info",
     # Misc common
-    "me", "xyz", "co.uk", "co.in",
+    "me", "xyz",
+    # Double / country second-level TLDs (apex extraction handles these)
+    "co.uk", "co.in", "com.au", "com.br", "co.za", "com.sg",
 ]
 
 # ── Slugification ─────────────────────────────────────────────────────────────
@@ -205,10 +208,13 @@ def crtsh_by_org(org_name: str, verbose=False) -> set:
     """Search crt.sh for certs issued to this org — reveals all their domains."""
     found = set()
     import urllib.parse
-    for query in [org_name, org_name.split()[0]]:   # try full name and first word
-        for attempt in range(3):
+    # dict.fromkeys dedupes when org_name is a single word (full == first word).
+    # 2 attempts × 25s keeps the worst case under the 60s budget the caller gives
+    # this source, so a slow crt.sh returns cleanly instead of being timed out.
+    for query in dict.fromkeys([org_name, org_name.split()[0]]):
+        for attempt in range(2):
             try:
-                data = fetch(f"https://crt.sh/?q={urllib.parse.quote(query)}&output=json", timeout=40)
+                data = fetch(f"https://crt.sh/?q={urllib.parse.quote(query)}&output=json", timeout=25)
                 for entry in json.loads(data):
                     for name in entry.get("name_value", "").split("\n"):
                         name = name.strip().lower().lstrip("*.")
@@ -222,9 +228,12 @@ def crtsh_by_org(org_name: str, verbose=False) -> set:
                             apex = '.'.join(parts[-2:])
                         found.add(apex)
                 break
-            except (json.JSONDecodeError, Exception):
-                if attempt < 2:
-                    time.sleep(4)
+            except Exception as e:
+                if attempt < 1:
+                    time.sleep(3)
+                elif verbose:
+                    print(f"  [!] crt.sh org search failed for {query!r} "
+                          f"({type(e).__name__}) — domain recall reduced", flush=True)
     if verbose and found:
         print(f"  [+] crt.sh org search ({org_name}): {len(found)} apex domains", flush=True)
     return found
@@ -256,36 +265,64 @@ def reverse_whois(primary_domain: str, org_slug: str, verbose=False) -> set:
 
 # ── Source D: GitHub org search ───────────────────────────────────────────────
 
+def _gh_json(path):
+    """GET api.github.com/<path> as parsed JSON. Prefer the `gh` CLI (uses the
+    user's existing auth + 5000/hr limit); fall back to an unauthenticated fetch
+    (60/hr). The old code always hit the API unauthenticated, so it 403'd after a
+    few calls and silently returned nothing — a real recall loss for this source."""
+    from shutil import which as _which
+    if _which("gh"):
+        try:
+            r = subprocess.run(["gh", "api", path], capture_output=True,
+                               text=True, timeout=20)
+            if r.returncode == 0 and r.stdout.strip():
+                return json.loads(r.stdout)
+        except (subprocess.SubprocessError, OSError, json.JSONDecodeError):
+            return None
+    data = fetch(f"https://api.github.com/{path}", timeout=15)
+    try:
+        return json.loads(data) if data else None
+    except json.JSONDecodeError:
+        return None
+
+
 def github_org_domains(org_name: str, verbose=False) -> set:
-    """Fetch GitHub org profile + repos README snippets for domain references."""
+    """Fetch GitHub org profile + repo homepages for domain references."""
     found = set()
     slug = re.sub(r'[^a-z0-9-]', '', org_name.lower().replace(' ', '-'))
     org_slug_root = re.sub(r'[^a-z0-9]', '', org_name.lower())[:6]
 
-    for gh_org in [slug, org_slug_root]:
-        data = fetch(f"https://api.github.com/orgs/{gh_org}", timeout=10)
-        try:
-            obj = json.loads(data)
-            blog = obj.get("blog", "")
-            if blog:
-                m = re.search(r'(?:https?://)?([a-zA-Z0-9._-]+\.[a-zA-Z]{2,})', blog)
-                if m:
-                    found.add(m.group(1).lower())
-        except Exception:
-            pass
+    for gh_org in {slug, org_slug_root}:
+        if not gh_org:
+            continue
+        obj = _gh_json(f"orgs/{gh_org}")
+        if isinstance(obj, dict):
+            blog = obj.get("blog", "") or ""
+            m = re.search(r'(?:https?://)?([a-zA-Z0-9._-]+\.[a-zA-Z]{2,})', blog)
+            if m:
+                found.add(m.group(1).lower())
 
-        # Also search repos for domain patterns
-        repos_data = fetch(f"https://api.github.com/orgs/{gh_org}/repos?per_page=50", timeout=10)
-        try:
-            for repo in json.loads(repos_data):
-                hp = repo.get("homepage", "") or ""
+        # Repo homepages. No slug filter — discovery casts wide; the downstream
+        # ownership validator is the validity gate (a real product domain may not
+        # contain the org slug, e.g. a separately-branded subsidiary site).
+        repos = _gh_json(f"orgs/{gh_org}/repos?per_page=100")
+        if isinstance(repos, list):
+            for repo in repos:
+                hp = (repo.get("homepage") or "")
                 m = re.search(r'(?:https?://)?([a-zA-Z0-9._-]+\.[a-zA-Z]{2,})', hp)
                 if m:
-                    d = m.group(1).lower()
-                    if org_slug_root[:4] in d:
-                        found.add(d)
-        except Exception:
-            pass
+                    found.add(m.group(1).lower())
+
+    # Drop code-hosting / SaaS / social domains that show up in org blogs and repo
+    # homepages but are never the target's own roots (e.g. a repo homepage that is
+    # itself a github.com URL). Validation would reject these anyway, but excluding
+    # them here avoids the noise + a wasted ownership lookup.
+    INFRA = ("github.com", "github.io", "githubusercontent.com", "gitlab.com",
+             "gitlab.io", "bitbucket.org", "readthedocs.io", "readthedocs.org",
+             "netlify.app", "vercel.app", "pages.dev", "herokuapp.com",
+             "twitter.com", "x.com", "linkedin.com", "facebook.com",
+             "youtube.com", "medium.com", "gravatar.com")
+    found = {d for d in found if not any(d == i or d.endswith("." + i) for i in INFRA)}
 
     if verbose and found:
         print(f"  [+] GitHub ({org_name}): {sorted(found)}", flush=True)
@@ -361,10 +398,21 @@ def main():
         f_github  = pool.submit(github_org_domains, args.org, args.verbose)
         f_wayback = pool.submit(wayback_apex, org_slug, args.verbose)
 
-        cert_domains    = f_cert.result(timeout=60)
-        whois_domains   = f_whois.result(timeout=30)
-        github_domains  = f_github.result(timeout=30)
-        wayback_domains = f_wayback.result(timeout=40)
+        def _safe(fut, t, label):
+            # A single hung/failed source (crt.sh JSON flakiness, whois timeout)
+            # must NOT crash discovery and wipe out the TLD-sweep + other results —
+            # which is exactly what an unguarded .result(timeout=) did: one slow
+            # crt.sh raised concurrent.futures.TimeoutError and lost every domain.
+            try:
+                return fut.result(timeout=t)
+            except Exception as e:
+                print(f"  [!] {label} source failed/timed out "
+                      f"({type(e).__name__}) — skipped", flush=True)
+                return set()
+        cert_domains    = _safe(f_cert,    60, "crt.sh")
+        whois_domains   = _safe(f_whois,   30, "reverse-whois")
+        github_domains  = _safe(f_github,  30, "github")
+        wayback_domains = _safe(f_wayback, 40, "wayback")
 
     # DNS-confirm B-E results (they may include false positives)
     candidates_bce = (cert_domains | whois_domains | github_domains | wayback_domains) - confirmed
@@ -392,6 +440,37 @@ def main():
               flush=True)
         confirmed |= ns_exists(leftover, args.verbose)
         print(f"    → {len(confirmed) - before_ns} NS-only root(s) kept", flush=True)
+
+    # ── Drop non-apex hostnames ──────────────────────────────────────────────
+    # Sources B-E (crt.sh, GitHub homepage, Wayback) routinely return
+    # subdomains like `docs.acme.com` because they crawl URLs, not WHOIS.
+    # Passing a subdomain into Phase 2 as a "root" wastes source quota (every
+    # API gets called twice for the same effective coverage) and creates
+    # downstream confusion in the report. Anything whose label-count exceeds
+    # what's expected for a registrable apex on its eTLD is filtered out
+    # here, with a logged reason.
+    # Reduce every discovered hostname to its registrable apex and KEEP the apex
+    # as a candidate root. A subdomain hit (e.g. links.acme-cdn.io from a GitHub /
+    # wayback source) thus contributes its apex (acme-cdn.io) — which a naive "drop
+    # non-apex" pass threw away, losing differently-branded owned roots like an
+    # org's URL-shortener or an acquisition. Apexes that aren't actually owned
+    # are filtered by validate_ownership downstream, so this is recall-positive.
+    apexes = set()
+    for d in sorted(confirmed):
+        parts = d.split(".")
+        # Double TLDs (co.uk, co.in, com.au, …) need 3 labels for an apex.
+        if len(parts) >= 3 and parts[-2] in ("co", "com", "net", "org",
+                                              "gov", "edu", "ac"):
+            n = 3
+        else:
+            n = 2
+        if len(parts) >= n:
+            apexes.add(".".join(parts[-n:]))
+    extracted = apexes - confirmed
+    if extracted:
+        print(f"\n[*] Extracted {len(extracted)} apex root(s) from subdomain hits "
+              f"(a.b.example.com → example.com): {sorted(extracted)[:8]}", flush=True)
+    confirmed = apexes
 
     # ── Write output ─────────────────────────────────────────────────────────
     with open(args.output, "w") as out:

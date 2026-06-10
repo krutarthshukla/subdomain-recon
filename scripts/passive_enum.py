@@ -48,6 +48,22 @@ def _load_keys(path=None):
 
 _KEYS = {}  # populated in main() and passed down
 
+# Sources that REQUIRE an API key. Without a key they're guaranteed to return
+# zero, so we skip them at startup (instead of making a wasted HTTP call that
+# silently returns 401/empty) and log once per missing key. This turns the
+# previous "Zero results from: netlas, host.io, c99, …" noise into a single
+# clear "[skip] netlas: no API key configured" message.
+_KEY_REQUIRED_SOURCES = {
+    "src_merklemap":  ("merklemap",  "https://merklemap.com (free tier)"),
+    "src_netlas":     ("netlas",     "https://netlas.io (50 req/day free)"),
+    "src_hostio":     ("hostio",     "https://host.io (1000/mo free)"),
+    "src_c99":        ("c99",        "https://api.c99.nl (~$5/mo)"),
+    "src_leakix":     ("leakix",     "https://leakix.net (free with reg)"),
+    "src_virustotal": ("virustotal", "https://virustotal.com/apikey"),
+    "src_alienvault": ("alienvault", "free, but OTX rate-limits anon hard"),
+    "src_chaos":      ("chaos",      "https://chaos.projectdiscovery.io"),
+}
+
 # ── HTTP helper ───────────────────────────────────────────────────────────────
 try:
     import requests as _req
@@ -57,6 +73,12 @@ try:
         for i in range(retries):
             try:
                 r = _req.get(url, headers=h, timeout=timeout)
+                # 4xx/5xx bodies (rate-limit JSON, WAF/auth pages) are NOT data —
+                # don't feed them to the subdomain parsers. Back off on 429.
+                if r.status_code == 429 and i < retries - 1:
+                    time.sleep(3); continue
+                if r.status_code >= 400:
+                    return ""
                 return r.text
             except Exception:
                 if i < retries - 1: time.sleep(3)
@@ -268,7 +290,7 @@ def src_commoncrawl(domain):
 def src_gau(domain):
     """gau extracts subdomains from Wayback, Common Crawl, AlienVault, URLScan."""
     subs = set()
-    out = run_tool(["gau", "--subs", "--threads", "5", domain], timeout=60)
+    out = run_tool(["gau", "--subs", "--threads", "10", domain], timeout=60)
     for line in out.splitlines():
         m = re.search(r'https?://([a-zA-Z0-9._-]+\.' + re.escape(domain) + r')', line)
         if m: subs.add(m.group(1).lower())
@@ -497,13 +519,16 @@ def src_asnmap(domain):
 #   src_riddler      — consistently unavailable since 2023
 #   src_threatcrowd  — service down/unreliable since late 2023
 ALL_SOURCES = [
-    # CT logs (v1)
-    src_crtsh, src_certspotter,
+    # CT logs. NOTE: subfinder -all -recursive (below) ALREADY queries crt.sh,
+    # certspotter, hackertarget, rapiddns, bufferover, anubis(jldc) and
+    # threatminer internally — running them again here is redundant work and
+    # extra crt.sh hits (→ self-inflicted rate-limiting). Keep crt.sh (primary,
+    # deeper recursion) + robtex (distinct passive DNS); drop the rest.
+    src_crtsh,
     # CT / passive — v2 additions
     src_merklemap, src_columbus, src_leakix,
-    # Free DNS/passive APIs (v1)
-    src_hackertarget, src_rapiddns, src_bufferover, src_jldc,
-    src_threatminer, src_robtex,
+    # Free passive DNS not well-covered by subfinder
+    src_robtex,
     # Paid/key APIs — v2 (degrade gracefully without keys)
     src_netlas, src_hostio, src_c99,
     # Threat intel (v1)
@@ -525,8 +550,28 @@ def enumerate_domain(domain):
     zero_sources = []
     print(f"\n[*] Passive enum: {domain}", flush=True)
 
-    with ThreadPoolExecutor(max_workers=14) as pool:
-        futures = {pool.submit(src, domain): src.__name__ for src in ALL_SOURCES}
+    # Filter out sources whose required API key is missing. Without this,
+    # they'd waste a worker slot making an HTTP call destined to return 401
+    # or empty, and clutter the log with "Zero results from: …". Skipping
+    # them up-front is faster AND clearer.
+    sources = []
+    skipped = []
+    for src in ALL_SOURCES:
+        if src.__name__ in _KEY_REQUIRED_SOURCES:
+            key_name, hint = _KEY_REQUIRED_SOURCES[src.__name__]
+            if not _KEYS.get(key_name):
+                skipped.append((key_name, hint))
+                continue
+        sources.append(src)
+    if skipped:
+        # Print the missing-key notice ONCE per domain (small log spam).
+        # Future improvement: hoist to main() so the notice prints once total.
+        for key_name, hint in skipped:
+            print(f"  [skip] {key_name:22s} no API key (get one: {hint})",
+                  flush=True)
+
+    with ThreadPoolExecutor(max_workers=20) as pool:
+        futures = {pool.submit(src, domain): src.__name__ for src in sources}
         for future in as_completed(futures):
             src_name = futures[future]
             try:
@@ -544,7 +589,7 @@ def enumerate_domain(domain):
     # A single retry after 5s catches most transient failures.
     CRITICAL_NAMES = {"src_crtsh", "src_subfinder", "src_alienvault",
                       "src_wayback", "src_hackertarget"}
-    retry = [s for s in ALL_SOURCES if s.__name__ in CRITICAL_NAMES
+    retry = [s for s in sources if s.__name__ in CRITICAL_NAMES
              and s.__name__ in zero_sources]
     if retry:
         print(f"  [!] Retrying {len(retry)} critical sources after 5s...", flush=True)

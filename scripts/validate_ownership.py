@@ -12,13 +12,19 @@ DESIGN (positive-signal-only):
   to "keep" let squatter brand-look-alike domains waste hours of a real scan.
 
   The new model requires AFFIRMATIVE proof of ownership. Signals (any one wins):
-    1. RDAP registrant org name matches --org-aliases   (strongest)
-    2. TLS cert SAN intersects a trusted root           (strongest — see note)
-    3. TLS cert subject.O matches --org-aliases         (strong)
-    4. HTTP redirect to a known-owned brand domain      (strong)
-    5. Soft-redirect body anchor/meta-refresh to brand  (strong — see note)
-    6. NS matches --trusted-ns-pattern (e.g. awsdns-)   (medium — narrow allowlist)
-    7. Brand label exact-match + live serving content   (weak; legacy heuristic)
+    1. MX/SPF/DMARC references a trusted root           (strongest — owner-only)
+    2. RDAP registrant org name matches --org-aliases   (strongest)
+    3. TLS cert SAN intersects a trusted root           (strongest — see note)
+    4. TLS cert SHA-256 fingerprint == trusted root's   (strongest — same cert)
+    5. TLS cert subject.O matches --org-aliases         (strong)
+    6. HTTP redirect to a known-owned brand domain      (strong)
+    7. Soft-redirect body anchor/meta-refresh to brand  (strong — see note)
+    8. NS overlaps the trusted delegation set           (strong on non-AWS)
+    9. >=2 A-record IPs shared with a trusted root      (medium)
+   10. NS matches --trusted-ns-pattern (e.g. awsdns-)   (medium — DEPRECATED,
+                                                          matches any cloud
+                                                          tenant; see note)
+   11. Brand label exact-match + live serving content   (weak; legacy heuristic)
 
   Note on (2) Cert SAN intersection:
     AWS ACM and most cloud TLS pipelines issue a single multi-SAN cert per
@@ -147,11 +153,25 @@ CGNAT = ipaddress.ip_network("100.64.0.0/10")
 
 _BIN = os.path.expanduser("~/.recon-tools/bin")
 
+# ProjectDiscovery tools share names with Python packages (httpx, dnsx).
+# pyenv shims will resolve `command -v httpx` to the Python httpx CLI, which
+# accepts totally different flags and will crash this script. Never accept
+# the PATH fallback for these names — require the binary in ~/.recon-tools/bin.
+_PD_TOOL_NAMES = {"httpx", "dnsx", "nuclei", "katana", "alterx", "tlsx",
+                  "subfinder", "asnmap", "mapcidr", "uncover", "shuffledns",
+                  "cdncheck"}
+
 
 def _have(name):
     cand = os.path.join(_BIN, name)
     if os.path.isfile(cand) and os.access(cand, os.X_OK):
         return cand
+    if name in _PD_TOOL_NAMES:
+        # Refuse PATH fallback for known-collision tool names — see memory
+        # note "pyenv shims shadow Go tools". Returning None makes the caller
+        # fall through to its pure-Python path instead of executing the wrong
+        # tool silently.
+        return None
     from shutil import which
     return which(name)
 
@@ -233,6 +253,88 @@ def ns_lookup(domains):
             if ns:
                 out[d] = ns
     return out
+
+
+def mail_record_lookup(domains):
+    """{apex: {"mx": [...], "spf": "...", "dmarc": "..."}} — single-call dig
+    fan-out. Mail records are an owner-only signal: only the legitimate
+    apex-owner can set DMARC `rua=...`, SPF `include:...`, or MX hosts —
+    parking services / squatters don't bother configuring these.
+
+    If a candidate's DMARC rua points at `dmarc@trustedroot.com`, or its SPF
+    includes `_spf.trustedroot.com`, or its MX is `mail.trustedroot.com`,
+    that's proof the owner of the trusted root configured the candidate.
+    """
+    domains = sorted({d.strip().lower() for d in domains if d.strip()})
+    out = {}
+    if not domains:
+        return out
+
+    def one(d):
+        rec = {"mx": [], "spf": "", "dmarc": ""}
+        try:
+            mx = subprocess.run(["dig", "+short", "+time=4", "+tries=2", "MX", d],
+                                capture_output=True, text=True, timeout=8).stdout
+            for ln in mx.splitlines():
+                # MX answer is "<pref> <hostname>." — strip pref + trailing dot
+                parts = ln.strip().split()
+                if len(parts) >= 2:
+                    rec["mx"].append(parts[-1].rstrip(".").lower())
+            spf = subprocess.run(["dig", "+short", "+time=4", "+tries=2", "TXT", d],
+                                 capture_output=True, text=True, timeout=8).stdout
+            for ln in spf.splitlines():
+                if "v=spf1" in ln.lower():
+                    rec["spf"] = ln.strip('"').lower()
+                    break
+            dmarc = subprocess.run(["dig", "+short", "+time=4", "+tries=2",
+                                    "TXT", f"_dmarc.{d}"],
+                                   capture_output=True, text=True, timeout=8).stdout
+            for ln in dmarc.splitlines():
+                if "v=dmarc1" in ln.lower():
+                    rec["dmarc"] = ln.strip('"').lower()
+                    break
+        except (subprocess.SubprocessError, OSError):
+            pass
+        return d, rec
+
+    with ThreadPoolExecutor(max_workers=max(1, min(40, len(domains)))) as pool:
+        for f in as_completed({pool.submit(one, d) for d in domains}):
+            d, rec = f.result()
+            if rec["mx"] or rec["spf"] or rec["dmarc"]:
+                out[d] = rec
+    return out
+
+
+def _mail_record_matches_trusted(rec, trusted_roots):
+    """Return (signal_type, matched_token) if any mail record references a
+    trusted root. signal_type is one of 'mx', 'spf', 'dmarc'."""
+    if not rec or not trusted_roots:
+        return ""
+    troots = sorted(trusted_roots, key=len, reverse=True)
+    # MX: any host whose apex equals or is suffixed by a trusted root
+    for mx in rec.get("mx", []):
+        for t in troots:
+            if mx == t or mx.endswith("." + t):
+                return ("mx", mx)
+    # SPF: `include:foo.trustedroot.com`, `redirect=trustedroot.com`,
+    # or `ip4:` doesn't count (any AWS tenant can use the same IP block)
+    spf = rec.get("spf", "")
+    if spf:
+        for m in re.finditer(r"(?:include|redirect|exists)[=:]([a-z0-9.\-_]+)", spf):
+            host = m.group(1).rstrip(".")
+            for t in troots:
+                if host == t or host.endswith("." + t):
+                    return ("spf", f"include:{host}")
+    # DMARC: rua / ruf addresses
+    dmarc = rec.get("dmarc", "")
+    if dmarc:
+        for m in re.finditer(r"r[uf]a=mailto:([^,;\s]+)", dmarc):
+            addr = m.group(1).lower()
+            host = addr.split("@")[-1].rstrip(".")
+            for t in troots:
+                if host == t or host.endswith("." + t):
+                    return ("dmarc", f"rua={addr}")
+    return ""
 
 
 def a_lookup(domains):
@@ -581,8 +683,9 @@ def _org_is_squatter(org_string):
 # ── Classification — positive-signal-only ─────────────────────────────────────
 def classify_root(apex, owned_roots, owned_labels, org_aliases,
                   trusted_ns_re, trusted_ns_set, trusted_cert_fps,
+                  trusted_ips,
                   ns_map, http_map, a_map, rdap_map, cert_map,
-                  body_redirect_map):
+                  body_redirect_map, mail_map):
     """Decide owned / rejected / uncertain for one root.
 
     Returns (status, reason). With positive-signal-only policy, "uncertain"
@@ -608,6 +711,15 @@ def classify_root(apex, owned_roots, owned_labels, org_aliases,
     sq = _org_is_squatter(registrant)
     if sq:
         return "rejected", f"registrant is squatter/broker ({sq!r} in {registrant!r})"
+
+    # === Strongest positive — Mail records reference a trusted root ===
+    # Only the owner can set MX/SPF/DMARC. If a candidate's DMARC rua points
+    # to dmarc@trustedroot.com, that's owner-configured by the trusted-root
+    # admin. Impossible to fake without controlling the trusted root.
+    mail_hit = _mail_record_matches_trusted(mail_map.get(apex, {}), owned_roots)
+    if mail_hit:
+        kind, token = mail_hit
+        return "owned", f"{kind.upper()} record references trusted root ({token})"
 
     # === Strongest positive — TLS cert SAN intersects a trusted root ===
     # AWS ACM / Let's Encrypt multi-SAN certs are issued once and served on
@@ -674,6 +786,18 @@ def classify_root(apex, owned_roots, owned_labels, org_aliases,
             if trusted_ns_re.search(n):
                 return "owned", f"NS matches trusted pattern ({n})"
 
+    # === Medium positive — same IP as a trusted root ===
+    # If the candidate resolves to the literal same IP(s) as a trusted root,
+    # they share infra. Strongest for IP-pinned EIPs / dedicated ALBs; weaker
+    # but still useful when the IP is a CloudFront edge or shared NAT, so we
+    # only treat IP overlap as positive when AT LEAST TWO IPs match (which
+    # is statistically near-impossible for unrelated tenants on the same
+    # cloud) — single-IP overlap could be a coincidence on a popular ALB.
+    if trusted_ips and ips:
+        overlap = set(ips) & trusted_ips
+        if len(overlap) >= 2:
+            return "owned", f"shares {len(overlap)} IPs with trusted roots ({sorted(overlap)[:2]})"
+
     # === Medium positive — CGNAT (internal-only asset) ===
     for ip in ips:
         try:
@@ -682,16 +806,19 @@ def classify_root(apex, owned_roots, owned_labels, org_aliases,
         except ValueError:
             continue
 
-    # === Weak positive — brand label EXACT MATCH + serving content ===
-    # Tightened from prior 'label in owned_labels' (substring) to exact match,
-    # so 'myrazorx' no longer satisfies the 'razorx' slug.
-    if label in owned_labels:
-        if status and 200 <= status < 400 and title:
-            return "owned", (f"brand label '{label}' serving live content "
-                             f"(HTTP {status})")
+    # === (removed) brand-label + live-content as a standalone "owned" signal ===
+    # A matching brand label on a live page is NOT proof of ownership: a squatter
+    # can register <brand>.<tld> and serve any page (this signal produced real
+    # false positives — a same-label domain on unrelated infra wrongly marked
+    # owned). A genuinely-owned brand-label domain almost always ALSO carries one
+    # of the stronger ties above (NS-overlap / cert-SAN / same-IP / RDAP / redirect
+    # / mail), which already returned "owned". A brand label with NO such tie now
+    # falls through to "uncertain" (excluded by default). Curate genuinely-owned
+    # outliers via the acquisitions hint (run_all.sh org mode) instead of relying
+    # on this heuristic.
 
     # === No positive signal ===
-    return "uncertain", "no positive ownership signal (no RDAP/cert/redirect/NS match)"
+    return "uncertain", "no positive ownership signal (brand label alone is not proof)"
 
 
 def main():
@@ -708,10 +835,15 @@ def main():
                          "Examples: 'Acme,Acme Software Private Limited'. "
                          "This is the strongest positive ownership signal.")
     ap.add_argument("--trusted-ns-pattern", default="",
-                    help="Regex applied to nameservers. Any NS matching is a "
-                         "positive ownership signal — pass your org's known DNS "
-                         "infrastructure pattern, e.g. 'awsdns|cloudflare' if "
-                         "your org's domains are all on AWS Route 53 + CF.")
+                    help="DEPRECATED — too coarse to be useful on its own. A "
+                         "pattern like 'awsdns' matches ~30%% of all domains "
+                         "(every Route 53 tenant on the planet); 'cloudflare' "
+                         "matches even more. The NS-overlap signal derived "
+                         "from --trusted automatically (which compares the "
+                         "literal NS hostnames of trusted roots vs candidates) "
+                         "is strictly better and runs by default. Only set "
+                         "this if your org uses a CUSTOM NS subdomain like "
+                         "'ns1.acmedns.net' that isn't on a public provider.")
     ap.add_argument("--include-uncertain", action="store_true",
                     help="Include domains with no positive ownership signal in "
                          "the output (legacy behavior). Default: exclude them "
@@ -780,6 +912,17 @@ def main():
               "enable. (You'll miss roots like acme.io that only carry the "
               "ownership signal in their cert SANs.)", flush=True)
 
+    # Derive trusted A-record IP set — same-IP overlap with these is a
+    # positive ownership signal (gate is overlap >= 2 to dodge edge-IP
+    # coincidence on CloudFront / shared ALB).
+    trusted_ips = set()
+    if trusted:
+        for d, ips in a_lookup(sorted(trusted)).items():
+            trusted_ips.update(ips)
+        if trusted_ips:
+            print(f"[*] Derived {len(trusted_ips)} trusted A-record IP(s) "
+                  f"from --trusted", flush=True)
+
     ns_map = ns_lookup(to_check)
     http_map = http_meta(to_check, args.timeout)
     a_map = a_lookup(to_check)
@@ -791,6 +934,8 @@ def main():
           f"<a>Found</a>)…", flush=True)
     body_redirect_map = body_redirect_lookup(to_check,
                                              timeout=min(args.timeout, 6))
+    print(f"[*] Mail-record lookups (MX/SPF/DMARC)…", flush=True)
+    mail_map = mail_record_lookup(to_check)
 
     owned_roots = set(trusted)
     owned_labels = set(slugs)
@@ -803,9 +948,10 @@ def main():
         status, reason = classify_root(r, owned_roots, owned_labels, org_aliases,
                                        trusted_ns_re, trusted_ns_set,
                                        trusted_cert_fps,
+                                       trusted_ips,
                                        ns_map, http_map, a_map,
                                        rdap_map, cert_map,
-                                       body_redirect_map)
+                                       body_redirect_map, mail_map)
         bucket[status][r] = reason
         if args.verbose:
             print(f"  [{status:9}] {r:<22} {reason}", flush=True)

@@ -38,6 +38,33 @@ from urllib.parse import urlparse
 # blocks pool shutdown and stalls the whole backgrounded run.
 socket.setdefaulttimeout(8)
 
+# Many techniques deliberately probe HTTPS endpoints with verify=False (S3
+# bucket probes, takeover canaries, snake-oil-cert services). Without this
+# urllib3 prints a multi-line InsecureRequestWarning for EVERY such request,
+# turning the run log into thousands of lines of identical noise. Suppress it
+# globally — we know we're skipping verification on purpose.
+try:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except (ImportError, AttributeError):
+    pass
+
+# Tools like bbot and katana emit ANSI color codes even when stdout is a pipe.
+# When their output is parsed line-by-line, color codes like "\x1b[36m" leak
+# into the extracted hostnames as garbage prefixes ("36mwww.example.com").
+# This regex strips ALL CSI escape sequences from arbitrary captured text.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+def _strip_ansi(s):
+    return _ANSI_RE.sub("", s)
+
+# Tell colored tools to skip the escape codes in the first place — defense in
+# depth alongside _strip_ansi. NO_COLOR is the cross-tool standard
+# (https://no-color.org); FORCE_COLOR=0 is npm/Node convention; CLICOLOR=0
+# is BSD/macOS convention.
+os.environ.setdefault("NO_COLOR", "1")
+os.environ.setdefault("FORCE_COLOR", "0")
+os.environ.setdefault("CLICOLOR", "0")
+
 try:
     import requests as _req
     def get(url, headers=None, timeout=15, allow_redirects=True, verify=True):
@@ -63,6 +90,9 @@ except ImportError:
     def get_text(url, **kw): return get(url, **kw)[0]
 
 def extract_domains(text, domain):
+    # Strip ANSI before regex matching so color codes can't fuse with hostnames.
+    # Without this, "\x1b[36mwww.example.com\x1b[0m" extracts as "36mwww.example.com".
+    text = _strip_ansi(text or "")
     pat = r'(?:[a-zA-Z0-9_-]+\.)+' + re.escape(domain)
     subs = set()
     for s in re.findall(pat, text, re.IGNORECASE):
@@ -257,7 +287,7 @@ def cloud_bucket_probe(domain, org_name):
             if status in [200, 403, 400]:
                 found.add(f"[AZURE] {url} (HTTP {status})")
 
-    with ThreadPoolExecutor(max_workers=20) as pool:
+    with ThreadPoolExecutor(max_workers=40) as pool:
         futs = []
         for p in list(patterns)[:40]:  # cap at 40 patterns
             futs.append(pool.submit(check_s3, p))
@@ -593,34 +623,49 @@ def asn_ptr_discovery(domain, org_name):
     org_slug = re.sub(r'[^a-z0-9]', '', org_name.lower())[:10]
 
     try:
-        # Try to get ASN from bgp.he.net (plain text query)
-        asn_data = get_text(f"https://bgp.he.net/dns/{domain}", timeout=10)
-        asns = re.findall(r'AS(\d+)', asn_data)
-
-        if not asns:
-            # Fallback: whois
+        # Resolve domain → announced IP prefixes. Primary path is asnmap (already
+        # installed by the toolchain): it maps a domain to its ASN(s) and the
+        # CIDRs they announce in one shot. The previous code scraped bgp.he.net,
+        # whose pages are JS-rendered (and used a #fragment the server never
+        # sees), so it reliably found nothing and this technique returned zero.
+        # RIPEstat's JSON API is the fallback for ASN→prefixes (no scraping).
+        ip_ranges = []
+        asnmap_bin = os.path.join(GOBIN, "asnmap")
+        if os.path.isfile(asnmap_bin):
             try:
-                whois_out = subprocess.run(
-                    ["whois", "-h", "whois.cymru.com", f" -v {socket.gethostbyname(domain)}"],
-                    capture_output=True, text=True, timeout=10
-                ).stdout
-                asns = re.findall(r'\|\s*(\d+)\s*\|', whois_out)
-            except Exception:
+                out = subprocess.run([asnmap_bin, "-d", domain, "-silent"],
+                                     capture_output=True, text=True, timeout=40).stdout
+                ip_ranges = [l.strip() for l in out.splitlines()
+                             if re.match(r'^\d+\.\d+\.\d+\.\d+/\d+$', l.strip())]
+            except (subprocess.SubprocessError, OSError):
                 pass
 
-        if not asns:
-            print(f"  [+] asn_ptr: no ASN found for {domain}", flush=True)
-            return "asn_ptr", subs
-
-        # For each ASN get IP prefixes (limit to first 3 ASNs, max 5 prefixes each)
-        ip_ranges = []
-        for asn in asns[:3]:
-            prefix_data = get_text(f"https://bgp.he.net/AS{asn}#_prefixes", timeout=10)
-            prefixes = re.findall(r'(\d+\.\d+\.\d+\.\d+/\d+)', prefix_data)
-            ip_ranges.extend(prefixes[:5])  # cap: 5 prefixes per ASN = max 15 ranges
-
         if not ip_ranges:
-            print(f"  [+] asn_ptr: no IP ranges found for ASN(s) {asns[:3]}", flush=True)
+            # Fallback: Team Cymru whois (IP → ASN), then RIPEstat (ASN → prefixes).
+            asns = []
+            try:
+                ip = socket.gethostbyname(domain)
+                cymru = subprocess.run(["whois", "-h", "whois.cymru.com", f" -v {ip}"],
+                                       capture_output=True, text=True, timeout=15).stdout
+                asns = re.findall(r'^\s*(\d+)\s*\|', cymru, re.M)
+            except (subprocess.SubprocessError, OSError, socket.gaierror):
+                asns = []
+            for asn in asns[:3]:
+                try:
+                    data = get_text(
+                        "https://stat.ripe.net/data/announced-prefixes/data.json"
+                        f"?resource=AS{asn}", timeout=15)
+                    obj = json.loads(data) if data else {}
+                    for p in obj.get("data", {}).get("prefixes", []):
+                        pfx = p.get("prefix", "")
+                        if re.match(r'^\d+\.\d+\.\d+\.\d+/\d+$', pfx):
+                            ip_ranges.append(pfx)
+                except Exception:
+                    pass
+
+        ip_ranges = ip_ranges[:15]  # cap total ranges to keep the PTR scan bounded
+        if not ip_ranges:
+            print(f"  [+] asn_ptr: no IP ranges found for {domain}", flush=True)
             return "asn_ptr", subs
 
         # PTR scan each range using dnsx if available
@@ -800,6 +845,29 @@ def esp_dkim_discovery(domain):
 
 # ── v2 Techniques (2024-2026 gap analysis) ────────────────────────────────────
 
+def _fetch_favicon_bytes(url, timeout=8):
+    """Fetch the RAW favicon bytes (not text-decoded) for Shodan-style hashing.
+
+    Shodan/uncover compute mmh3.hash(base64.encodebytes(raw_icon_bytes)). The
+    previous code pulled the icon through get() (which returns a decoded str)
+    and re-encoded it latin-1 — that mangles the binary ICO, so the hash never
+    matched anything and the pivot silently returned zero. Fetching the bytes
+    directly is what makes the hash correct.
+    """
+    try:
+        import ssl as _ssl, urllib.request as _ur
+        ctx = _ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = _ssl.CERT_NONE
+        req = _ur.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with _ur.urlopen(req, timeout=timeout, context=ctx) as r:
+            if getattr(r, "status", 200) != 200:
+                return b""
+            return r.read(262144)  # 256 KB cap — favicons are tiny
+    except Exception:
+        return b""
+
+
 def favicon_hash_pivot(domain):
     """MurmurHash3 of favicon → Shodan/uncover pivot for shared-infra discovery."""
     subs = set()
@@ -808,9 +876,8 @@ def favicon_hash_pivot(domain):
     except ImportError:
         return "favicon_hash", subs
     for favicon_url in [f"https://{domain}/favicon.ico", f"https://www.{domain}/favicon.ico"]:
-        raw_text, _, _ = get(favicon_url, timeout=8)
-        if not raw_text: continue
-        raw = raw_text.encode("latin-1", errors="ignore")
+        raw = _fetch_favicon_bytes(favicon_url, timeout=8)
+        if not raw: continue
         b64 = _b64.encodebytes(raw).decode("utf-8")
         fav_hash = mmh3.hash(b64)
         uncover = os.path.join(GOBIN, "uncover")
@@ -914,26 +981,61 @@ def bbot_runner(domain):
     if not os.path.isfile(bbot_bin) and not shutil.which("bbot"):
         return "bbot", subs
     with tempfile.TemporaryDirectory() as tmpdir:
+        # Non-interactive hardening (see SKILL.md first-run setup):
+        #   --no-deps    skip the module-dep installer (it sudo-prompts → EOFError)
+        #   -rf passive  passive modules need no root (active enum is Phase 4's job)
+        #   -y           skip the scan-confirm prompt
+        #   -om json     emit the JSON event stream
+        #   stdin=DEVNULL no interactive hang
+        # bbot also needs core deps present (7z, openssl headers) + ~/.bbot
+        # writable, and it can idle after discovery (a slow module not
+        # terminating) — so we parse its on-disk output even on a timeout kill.
+        err_blob = ""
         try:
-            out = subprocess.run(
-                [bbot_bin, "-t", domain, "-p", "subdomain-enum",
-                 "-o", tmpdir, "-y", "--allow-deadly"],
-                capture_output=True, text=True, timeout=600
+            proc = subprocess.run(
+                [bbot_bin, "-t", domain, "-p", "subdomain-enum", "-rf", "passive",
+                 "-o", tmpdir, "-om", "json", "-y", "--no-deps"],
+                capture_output=True, text=True, timeout=600,
+                stdin=subprocess.DEVNULL,
             )
-            for root, _, files in os.walk(tmpdir):
-                for fn in files:
-                    if fn.endswith(".ndjson"):
-                        with open(os.path.join(root, fn)) as f:
-                            for line in f:
-                                try:
-                                    ev = json.loads(line)
-                                    if ev.get("type") == "DNS_NAME":
-                                        s = ev.get("data","").lower().strip()
-                                        if s.endswith("."+domain) or s == domain: subs.add(s)
-                                except Exception: pass
-            subs |= extract_domains(out.stdout, domain)
-        except Exception:
-            pass
+            err_blob = (proc.stderr or "") + (proc.stdout or "")
+        except subprocess.TimeoutExpired:
+            err_blob = "timeout"   # output is written incrementally — parse it anyway
+        except Exception as e:
+            err_blob = type(e).__name__
+        # bbot's subdomain-enum writes BOTH subdomains.txt (one host/line) and a
+        # JSON event stream (output.json / *.ndjson). Read whichever exist — this
+        # runs even after a timeout kill, recovering subs found before the kill.
+        for root, _, files in os.walk(tmpdir):
+            for fn in files:
+                fp = os.path.join(root, fn)
+                try:
+                    if fn == "subdomains.txt":
+                        for line in open(fp):
+                            s = line.strip().lower().rstrip(".")
+                            if s and (s.endswith("." + domain) or s == domain):
+                                subs.add(s)
+                    elif fn.endswith(".json") or fn.endswith(".ndjson"):
+                        for line in open(fp):
+                            try:
+                                ev = json.loads(line)
+                            except Exception:
+                                continue
+                            if ev.get("type") == "DNS_NAME":
+                                s = (ev.get("data") or "").lower().strip().rstrip(".")
+                                if s.endswith("." + domain) or s == domain:
+                                    subs.add(s)
+                except OSError:
+                    continue
+        if not subs:
+            if "sudo password" in err_blob or "EOFError" in err_blob:
+                print("  [!] bbot skipped — one-time setup needed: ensure `7z` + "
+                      "openssl headers are installed and `~/.bbot` is writable "
+                      "(see SKILL.md first-run). The other techniques + active "
+                      "enum carry recall.", flush=True)
+            elif err_blob and err_blob != "timeout":
+                last = (err_blob.strip().splitlines() or [""])[-1]
+                print(f"  [!] bbot error: {last[:160]}", flush=True)
     print(f"  [+] bbot:               {len(subs)}", flush=True)
     return "bbot", subs
 
@@ -944,12 +1046,14 @@ def katana_crawl(domain):
     katana_bin = os.path.join(GOBIN, "katana")
     if not os.path.isfile(katana_bin): return "katana", subs
     try:
+        # -nc explicitly disables color even though we set NO_COLOR=1; some
+        # older katana builds honor only -nc. Belt-and-braces.
         out = subprocess.run(
             [katana_bin, "-u", f"https://{domain}", "-hl", "-jc", "-jsl",
-             "-xhr", "-f", "fqdn", "-d", "3", "-c", "20", "-silent"],
+             "-xhr", "-f", "fqdn", "-d", "3", "-c", "20", "-silent", "-nc"],
             capture_output=True, text=True, timeout=120
         ).stdout
-        for line in out.splitlines():
+        for line in _strip_ansi(out).splitlines():
             line = line.strip().lower()
             if line.endswith("."+domain) or line == domain: subs.add(line)
     except Exception: pass
@@ -966,9 +1070,19 @@ def subwiz_predict(domain, known_subs_file=None):
         # from — without it, this technique simply can't run.
         print(f"  [+] subwiz_ml:          skipped (no --known-subs file)", flush=True)
         return "subwiz", subs
+    # Resolve subwiz to a WORKING binary. Bare `subwiz` on PATH usually hits a
+    # pyenv shim for an old Python (3.8) where subwiz's 3.10+ syntax (`X | None`)
+    # crashes on import → silent 0. Prefer the pipx-installed binary (own venv).
+    import shutil as _sh
+    subwiz_bin = next((p for p in (os.path.expanduser("~/.local/bin/subwiz"),
+                                   os.path.join(GOBIN, "subwiz"))
+                       if os.path.isfile(p)), None) or _sh.which("subwiz")
+    if not subwiz_bin:
+        print("  [+] subwiz_ml:          skipped (subwiz not installed)", flush=True)
+        return "subwiz", subs
     try:
         out = subprocess.run(
-            ["subwiz", "-i", known_subs_file, "-n", "500", "-t", "0.0"],
+            [subwiz_bin, "-i", known_subs_file, "-n", "500", "-t", "0.0"],
             capture_output=True, text=True, timeout=60
         ).stdout
         predictions = [l.strip() for l in out.splitlines() if l.strip()]

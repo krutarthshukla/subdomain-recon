@@ -1,6 +1,6 @@
 # subdomain-recon
 
-Give it an organisation name and a few seed domains, and it maps out the whole external footprint: all the root domains the org owns, every subdomain it can find, and which of those are actually live. It pulls from passive sources first, then layers on the more aggressive techniques, and finishes by probing what's up and writing a report.
+Give it an organisation name — or just a domain or two — and it maps out the whole external footprint: all the root domains the org owns, every subdomain it can find, and which of those are actually live. Hand it an **org name** and it discovers and validates the owned roots first; hand it **domains** directly and it goes straight to enumerating their subdomains. It pulls from passive sources first, then layers on the more aggressive techniques, and finishes by probing what's up and writing a report.
 
 In practice it tends to surface noticeably more than running `subfinder` or `amass` on their own, mostly because it doesn't stop at certificate transparency — it also pivots on favicons, TLS certs, source maps, ASN ranges, and a few ML and brute-force passes.
 
@@ -10,7 +10,7 @@ In practice it tends to surface noticeably more than running `subfinder` or `ama
 - **Checks ownership before enumerating.** A domain resolving doesn't mean the org owns it — plenty are parked or squatted. This step sorts roots into owned / uncertain / rejected so you don't waste time enumerating someone else's parking page. Rejected domains are logged, not silently dropped.
 - **27 passive sources.** Merklemap, crt.sh, Columbus, LeakIX, Netlas, host.io, C99.nl, `uncover` (which itself wraps 18 engines), asnmap + PTR, and more.
 - **25 advanced techniques.** Favicon-hash pivoting, `.well-known` app-association files, source-map extraction, Azure tenant enumeration, SaaS-platform patterns, Postman workspace search, BBOT, the katana JS crawler, `subwiz` ML prediction, BadDNS takeover checks, and JARM/TLS-SAN pivoting.
-- **Active enumeration.** DNS brute-force against the n0kovo 3M wordlist, permutation enrichment with `alterx`, and TLS SAN-on-CIDR.
+- **Active enumeration.** DNS brute-force (top-110k wordlist by default; n0kovo 3M optional), permutation enrichment with `alterx`, and TLS SAN-on-CIDR — run in parallel per domain with per-domain watchdogs.
 - **Live probing and a report.** Probes everything it found and writes a text report grouped by source domain.
 - **Continuous monitoring (optional).** Subscribe to CT logs and get alerted when new subdomains show up.
 
@@ -65,16 +65,23 @@ Merklemap, Validin, LeakIX, and Netlas together cost under $100/mo and cover mor
 
 ## Quick start
 
-One command runs the whole thing:
+One command runs the whole thing. Give it **either** an org name **or** one or
+more domains — the mode is auto-detected:
 
 ```bash
-bash scripts/run_all.sh "Acme Corp" "acme.com,acquired-co.com,product.io"
+# Org name → discover every owned root, then enumerate all of them
+bash scripts/run_all.sh "Acme Corp"
 
-# Or point the output somewhere specific
-bash scripts/run_all.sh "Acme Corp" "acme.com,acquired-co.com" /custom/output.txt
+# A single domain → enumerate just that domain's subdomains
+bash scripts/run_all.sh "acme.com"
+
+# Several domains → enumerate exactly those (no root discovery)
+bash scripts/run_all.sh "acme.com,acquired-co.com,product.io"
 ```
 
-By default the report lands at `~/Desktop/<OrgName>_domains.txt`, with live hosts listed under a `# LIVE HOSTS` section at the bottom.
+Each run is self-contained under `~/Desktop/<Org>_<timestamp>/`: the report
+(`<Org>_domains.txt`, with live hosts under a `# LIVE HOSTS` section), the full
+`run.log`, per-phase intermediates in `work/`, and (org mode) `rejected_domains.txt`.
 
 ## How it works
 
@@ -104,7 +111,7 @@ There are eight stages. Each one feeds the next, and you can run any of them on 
    └──────────────┬───────────────┘
                   │ advanced subdomains
    ┌──────────────▼───────────────┐
-   │ Phase 4   Active Enumeration  │  brute-force (n0kovo 3M),
+   │ Phase 4   Active Enumeration  │  brute (top-110k, parallel+watchdog),
    │                               │  permutation, TLS SAN-on-CIDR
    └──────────────┬───────────────┘
                   │ brute / permuted subdomains
@@ -130,7 +137,7 @@ There are eight stages. Each one feeds the next, and you can run any of them on 
 | **1.5 — Ownership Validation** | confirmed roots | owned roots, rejected roots | Decides whether each root really belongs to the org. Owned (trusted or with a clear ownership signal) and uncertain (no signal, but kept just in case) both move on; parked or for-sale domains get set aside and logged. |
 | **2 — Passive Enumeration** | owned roots | passive subdomains | Queries 27 passive sources (Merklemap, crt.sh, Columbus, LeakIX, Netlas, host.io, C99.nl, `uncover`'s 18 engines, asnmap + PTR, and so on). Never touches the target directly. |
 | **3 — Advanced Techniques** | roots + passive results | advanced subdomains | Runs 25 pivoting techniques: favicon hashes, `.well-known` app-association, source maps, Azure tenants, 17 SaaS patterns, Postman search, BBOT, katana JS crawling, `subwiz` ML prediction, BadDNS takeover checks, and JARM/TLS-SAN pivots. |
-| **4 — Active Enumeration** | owned roots + passive results | brute / permuted subdomains | DNS brute-force against the n0kovo 3M wordlist, permutation enrichment, and TLS SAN-on-CIDR. Wildcards are tested first so you don't drown in false positives. |
+| **4 — Active Enumeration** | owned roots + passive results | brute / permuted subdomains | DNS brute-force (top-110k by default; n0kovo 3M optional), permutation enrichment, and TLS SAN-on-CIDR — run in parallel per domain with per-domain watchdogs. Wildcards are tested first so you don't drown in false positives. |
 | **5 — Merge + Dedupe** | everything above | merged subdomain set | Combines all the sources, normalises case, removes duplicates, and updates the per-org cache. |
 | **6 — Live Probe** | merged subdomains | live hosts | Probes everything over HTTP/HTTPS (300 threads) and records status, title, and detected tech. |
 | **7 — Report** | merged subdomains + rejected roots | `~/Desktop/<Org>_domains.txt` | Writes the final report grouped by source domain, with live hosts at the end. |

@@ -1,25 +1,61 @@
 #!/usr/bin/env bash
-# run_all.sh — Master orchestrator for subdomain-recon skill
+# run_all.sh — Single autopilot engine for the subdomain-recon skill.
 #
-# Usage:
-#   bash run_all.sh "Acme Corp" "acme.com,acquired-co.com,product.io"
-#   bash run_all.sh "Acme Corp" "acme.com,acquired-co.com" /custom/output.txt
+# The user provides ONE thing — an org name OR domain(s). Everything else runs
+# automatically end-to-end. SKILL.md just fires this with the user's input; no
+# manual phase-stepping by the model.
 #
-# IMPORTANT — file writing rules (hard-won lessons):
-#   NEVER use tool flags like -o, -w to write output files.
-#   They fail silently when the tool runs as a background subprocess.
-#   ALWAYS use shell stdout redirect: tool ... > file.txt
-#   This applies to: puredns, dnsx, httpx, alterx
+#   bash run_all.sh "Acme"                       # org   → discover+validate+enum
+#   bash run_all.sh "acme.com"                   # domain→ enumerate that domain
+#   bash run_all.sh "acme.com,acme.io,acmex.in"  # domains→ enumerate exactly those
+#
+# IMPORTANT — file-writing rules (hard-won):
+#   NEVER use tool flags like -o/-w to write output files from a backgrounded
+#   subprocess — they fail silently. ALWAYS use a shell stdout redirect:
+#   `tool ... > file.txt`. Applies to puredns/dnsx/httpx/alterx/tlsx.
 
 set -euo pipefail
 
-# ── Args ──────────────────────────────────────────────────────────────────────
-ORG="${1:?Usage: run_all.sh <OrgName> <domain1,domain2,...> [output.txt]}"
-DOMAINS="${2:?Provide comma-separated domains}"
+# ── Input — the ONLY thing the user provides ─────────────────────────────────
+# A single field: an ORG NAME, or one/many DOMAINS. Mode is auto-detected:
+#   • bare org name   ("Acme")             → MODE=org:    discover roots →
+#                                            validate ownership → enumerate every
+#                                            owned root's subdomains.
+#   • one domain      ("acme.com")         → MODE=domain: subdomains of that
+#                                            domain only (NO root discovery).
+#   • many domains    ("acme.com,acme.io") → MODE=domain: subdomains of exactly
+#                                            those, no discovery.
+RAW="${1:?Usage: run_all.sh \"<org name | domain | domain1,domain2,...>\"}"
+
+# "domainish" = label(.label)+ with no whitespace (a real domain, not "Acme Corp").
+is_domainish() { [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9-]+)+$ ]]; }
+
+MODE="org"; DOMAINS=""
+IFS=',' read -ra _RAWTOKS <<< "$RAW"
+_any=0; _all_dom=1
+for _t in "${_RAWTOKS[@]}"; do
+    _t="$(echo "$_t" | xargs)"; [ -z "$_t" ] && continue; _any=1
+    is_domainish "$_t" || { _all_dom=0; break; }
+done
+if [ "$_any" -eq 1 ] && [ "$_all_dom" -eq 1 ]; then
+    MODE="domain"
+    # NB: tr -d ' \t' (NOT [:space:], which also eats the newlines we just split on).
+    DOMAINS="$(echo "$RAW" | tr 'A-Z' 'a-z' | tr ',' '\n' | tr -d ' \t' | grep . | sort -u | paste -sd, -)"
+    # Display label from the first domain's registrable part (handles co.uk/co.in
+    # double-TLDs). Used only for the run-dir name + report title, never for recon.
+    _label="$(echo "${DOMAINS%%,*}" | awk -F. '{ n=NF;
+        if (n>=3 && ($(n-1)=="co"||$(n-1)=="com"||$(n-1)=="net"||$(n-1)=="org"||$(n-1)=="gov"||$(n-1)=="edu"||$(n-1)=="ac")) print $(n-2); else print $(n-1) }')"
+    ORG="$(echo "${_label:0:1}" | tr 'a-z' 'A-Z')${_label:1}"        # "acme.com" → "Acme"
+else
+    MODE="org"
+    ORG="$RAW"
+fi
 
 # ── Per-run output dir on Desktop: <Org>_<timestamp> (report + full log) ──────
 TS="$(date +%Y%m%d_%H%M%S)"
-RUNDIR="$HOME/Desktop/${ORG// /_}_${TS}"
+# SR_RUNDIR lets a caller (e.g. bounty-recon) nest this run under its own dir and
+# consume the outputs; default is a fresh timestamped dir on the Desktop.
+RUNDIR="${SR_RUNDIR:-$HOME/Desktop/${ORG// /_}_${TS}}"
 mkdir -p "$RUNDIR"
 LOG="$RUNDIR/run.log"
 # Mirror EVERYTHING (stdout+stderr, every phase + tool) into the run log while
@@ -31,7 +67,7 @@ exec > >(tee -a "$LOG") 2>&1
 set -o errtrace
 trap 'rc=$?; echo "[FATAL] run_all.sh aborted at line ${LINENO} (exit ${rc})"' ERR
 
-OUTPUT="${3:-$RUNDIR/${ORG// /_}_domains.txt}"
+OUTPUT="$RUNDIR/${ORG// /_}_domains.txt"
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -64,7 +100,8 @@ pkill -9 -f "$TOOLS_DIR/bin/dnsx"    2>/dev/null || true
 pkill -9 -f "$TOOLS_DIR/bin/alterx"  2>/dev/null || true
 sleep 1
 
-WORKDIR="/tmp/recon_${ORG// /_}_$$"
+# All intermediates live under the run dir (auditable, survives /tmp GC).
+WORKDIR="$RUNDIR/work"
 mkdir -p "$WORKDIR"
 
 # On Ctrl-C / kill: take down backgrounded children AND salvage whatever
@@ -88,8 +125,6 @@ banner() { echo -e "\n${CYAN}═════════════════
 ok()     { echo -e "${GREEN}[✓]${NC} $*"; }
 warn()   { echo -e "${YELLOW}[!]${NC} $*"; }
 info()   { echo -e "    $*"; }
-
-IFS=',' read -ra DOMAIN_ARR <<< "$DOMAINS"
 
 # ── Phase 0: Tools check + auto-install ───────────────────────────────────────
 # Portable across machines: if ANY required tool is missing, run the installer
@@ -122,7 +157,7 @@ list_missing() {
         fi
     done
     for b in "${REQUIRED_PY[@]}"; do
-        command -v "$b" &>/dev/null || python3 -c "import $b" 2>/dev/null || m+=("$b")
+        [ -e "$TOOLS_DIR/bin/$b" ] || command -v "$b" &>/dev/null || python3 -c "import $b" 2>/dev/null || m+=("$b")
     done
     echo "${m[*]:-}"
 }
@@ -152,20 +187,104 @@ fi
 [ -f "$RESOLVERS" ] && ok "resolvers: $(wc -l < "$RESOLVERS") entries" || warn "resolvers missing"
 [ -f "$WORDLIST"  ] && ok "wordlist: $(wc -l < "$WORDLIST") words" || warn "wordlist missing"
 
-# ── Phase 1: Passive enumeration ──────────────────────────────────────────────
-banner "Phase 1 — Passive Enumeration (19 sources × ${#DOMAIN_ARR[@]} domains)"
+# ── Phase 1 + 1.5: Domain discovery + ownership validation (ORG MODE only) ────
+# Org mode: the user gave only a name, so we have to FIND the owned roots before
+# we can enumerate. domain_discovery.py casts the wide net (cert/whois/wayback/
+# github/NS sweeps); validate_ownership.py then keeps only roots with a positive
+# ownership signal, so enumeration isn't wasted on parked/squatted look-alikes.
+# Domain mode: the user named exact targets — trust them, skip discovery.
+if [ "$MODE" = "org" ]; then
+    banner "Phase 1 — Domain Discovery (org: $ORG)"
+    ORG_SLUG="$(echo "$ORG" | tr 'A-Z' 'a-z' | tr -cd 'a-z0-9')"
+    CONFIRMED="$WORKDIR/confirmed_domains.txt"
+
+    # Curated acquisitions/subsidiary hint — deterministic coverage for the
+    # differently-branded subsidiaries free OSINT can't auto-discover (e.g. an
+    # org's acquisitions on unrelated brand names). Optional file:
+    #   ~/.config/subdomain-recon/acquisitions.yaml
+    #   <org>:               # matched by slug, case/space-insensitive
+    #     domains: [a.com, b.io]
+    #     names:   [BrandA, BrandB]
+    HINT_FILE="$HOME/.config/subdomain-recon/acquisitions.yaml"
+    HINT_DOMAINS=""; HINT_NAMES=""
+    if [ -f "$HINT_FILE" ]; then
+        HINT_OUT="$(python3 - "$HINT_FILE" "$ORG" <<'PY' 2>/dev/null
+import sys, re
+try:
+    import yaml
+except Exception:
+    sys.exit(0)
+try:
+    data = yaml.safe_load(open(sys.argv[1])) or {}
+except Exception:
+    sys.exit(0)
+slug = re.sub(r'[^a-z0-9]', '', sys.argv[2].lower())
+entry = None
+if isinstance(data, dict):
+    for k, v in data.items():
+        if re.sub(r'[^a-z0-9]', '', str(k).lower()) == slug:
+            entry = v; break
+doms, names = [], []
+if isinstance(entry, dict):
+    doms = entry.get('domains') or []; names = entry.get('names') or []
+elif isinstance(entry, list):
+    doms = entry
+j = lambda xs: ','.join(str(x).strip() for x in xs if str(x).strip())
+print("HINT_DOMAINS='%s'" % j(doms))
+print("HINT_NAMES='%s'" % j(names))
+PY
+)"
+        eval "$HINT_OUT" 2>/dev/null || true
+        [ -n "$HINT_DOMAINS" ] && ok "acquisitions hint: $HINT_DOMAINS"
+    fi
+
+    # Hint names join the slug-sweep entity list; the org slug is always included.
+    ABBR="$ORG_SLUG"; [ -n "$HINT_NAMES" ] && ABBR="$ORG_SLUG,$HINT_NAMES"
+    python3 "$SCRIPTS/domain_discovery.py" --org "$ORG" \
+        --abbreviations "$ABBR" --output "$CONFIRMED" 2>&1 || : > "$CONFIRMED"
+    # Seed the canonical apex + any curated acquisition domains as candidates.
+    printf '%s\n' "${ORG_SLUG}.com" >> "$CONFIRMED"
+    [ -n "$HINT_DOMAINS" ] && printf '%s\n' "$HINT_DOMAINS" | tr ',' '\n' | grep . >> "$CONFIRMED"
+    sort -u "$CONFIRMED" -o "$CONFIRMED"
+    ok "discovery: $(wc -l < "$CONFIRMED" | xargs) candidate root(s)"
+
+    banner "Phase 1.5 — Ownership Validation"
+    OWNED="$WORKDIR/owned_domains.txt"
+    REJECTED="$RUNDIR/rejected_domains.txt"
+    # Curated acquisition domains pass through as trusted-owned (operator asserts
+    # ownership); hint names extend --org-aliases so their RDAP/cert matches too.
+    TRUSTED="${ORG_SLUG}.com"; [ -n "$HINT_DOMAINS" ] && TRUSTED="${ORG_SLUG}.com,$HINT_DOMAINS"
+    ALIASES="$ORG"; [ -n "$HINT_NAMES" ] && ALIASES="$ORG,$HINT_NAMES"
+    python3 "$SCRIPTS/validate_ownership.py" \
+        --input "$CONFIRMED" \
+        --trusted "$TRUSTED" \
+        --org-aliases "$ALIASES" \
+        --slugs "$ORG_SLUG" \
+        --output "$OWNED" --rejected "$REJECTED" 2>&1 || : > "$OWNED"
+    DOMAINS="$(grep -vE '^#|^$' "$OWNED" 2>/dev/null | paste -sd, - || true)"
+    [ -z "$DOMAINS" ] && DOMAINS="${ORG_SLUG}.com"
+    ok "owned roots → enumeration: $DOMAINS"
+else
+    info "domain mode — enumerating exactly: $DOMAINS  (no root discovery)"
+fi
+IFS=',' read -ra DOMAIN_ARR <<< "$DOMAINS"
+# Emit the enumerated roots so a caller (e.g. bounty-recon) can pick up the scope.
+printf '%s\n' "$DOMAINS" | tr ',' '\n' | grep . > "$RUNDIR/owned_roots.txt" 2>/dev/null || true
+
+# ── Phase 2: Passive enumeration ──────────────────────────────────────────────
+banner "Phase 2 — Passive Enumeration (× ${#DOMAIN_ARR[@]} domains)"
 PASSIVE_OUT="$WORKDIR/passive.txt"
 python3 "$SCRIPTS/passive_enum.py" --domains "$DOMAINS" --output "$PASSIVE_OUT"
 ok "Passive: $(grep -cv "^#" "$PASSIVE_OUT" 2>/dev/null || echo 0) subdomains"
 
-# ── Phase 2: Advanced techniques — parallel ────────────────────────────────────
-banner "Phase 2 — Advanced Techniques (parallel)"
+# ── Phase 3: Advanced techniques — parallel ────────────────────────────────────
+banner "Phase 3 — Advanced Techniques (parallel)"
 ADVANCED_OUT="$WORKDIR/advanced.txt"
 > "$ADVANCED_OUT"
 pids=()
 for domain in "${DOMAIN_ARR[@]}"; do
     domain=$(echo "$domain" | xargs)
-    # Pass the Phase 1 passive output as --known-subs so subwiz_predict (ML
+    # Pass the Phase 2 passive output as --known-subs so subwiz_predict (ML
     # subdomain prediction) has a seed to work from. Without it, subwiz
     # early-returns silently and the ML technique never runs.
     python3 "$SCRIPTS/advanced_techniques.py" \
@@ -178,13 +297,14 @@ for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
 cat "$WORKDIR"/adv_*.txt >> "$ADVANCED_OUT" 2>/dev/null || true
 ok "Advanced: $(grep -c "." "$ADVANCED_OUT" 2>/dev/null || echo 0) subdomains"
 
-# ── Phase 3: Active enumeration ───────────────────────────────────────────────
-banner "Phase 3 — Active Enumeration"
+# ── Phase 4: Active enumeration ───────────────────────────────────────────────
+banner "Phase 4 — Active Enumeration"
 
 BRUTE_OUT="$WORKDIR/brute.txt"
 PERM_OUT="$WORKDIR/perms.txt"
 ZONE_OUT="$WORKDIR/zonetransfer.txt"
-> "$BRUTE_OUT"; > "$PERM_OUT"; > "$ZONE_OUT"
+TLS_OUT="$WORKDIR/tls_san.txt"
+> "$BRUTE_OUT"; > "$PERM_OUT"; > "$ZONE_OUT"; > "$TLS_OUT"
 
 # Build tiered wordlists (generated once from the main 110k list)
 WL_LARGE="${WORDLIST}"
@@ -265,131 +385,139 @@ for domain in "${DOMAIN_ARR[@]}"; do
 done
 ok "Zone transfers: $(wc -l < "$ZONE_OUT") records"
 
-# ── Brute-force — sequential per domain, tiered wordlist ─────────────────────
-# KEY FIX: puredns with 16k resolvers has false wildcard detection.
-# Pass --resolvers-trusted with 36 known-good resolvers for wildcard detection only.
-# The 16k resolvers are still used for speed; trusted resolvers prevent false detection.
-echo "[*] Brute-force..."
+# ── Brute-force — PARALLEL per domain, per-domain watchdog, tiered wordlist ──
+# Each domain runs in its own subshell so one slow/dead domain can't wedge the
+# rest (the earlier sequential loop could hang the whole phase on domain #1 if a
+# resolver stalled). A 10-minute watchdog hard-kills a brute that overruns.
+# Wildcards are still filtered by puredns; tiering still picks the wordlist size
+# from the passive count; --resolvers-trusted keeps wildcard detection sane
+# against the 16k-resolver list.
+echo "[*] Brute-force (parallel, per-domain 10-min watchdog) — $(date)"
 for domain in "${DOMAIN_ARR[@]}"; do
     domain=$(echo "$domain" | xargs)
+    (
+        # On a wildcard domain we rely on puredns to filter catch-all responses;
+        # only skip when puredns is unavailable (dnsx/python can't filter them).
+        if is_wildcard_domain "$domain" && ! [ -f "$PUREDNS" ]; then
+            echo "  $domain: brute-force skipped (wildcard + puredns unavailable)"
+            exit 0
+        fi
+        wl=$(_pick_wordlist "$domain")
+        if [ -z "$wl" ] || [ ! -f "$wl" ]; then exit 0; fi
 
-    # On a wildcard domain we rely on puredns to filter the catch-all responses.
-    # Only skip when puredns is unavailable, since the dnsx/python fallbacks
-    # cannot filter wildcards and would flood the results with false positives.
-    if is_wildcard_domain "$domain" && ! [ -f "$PUREDNS" ]; then
-        echo "  $domain: brute-force skipped (wildcard + puredns unavailable for filtering)"
-        continue
-    fi
-
-    wl=$(_pick_wordlist "$domain")
-    passive_c=$(grep -cE "(^|\.)${domain//./\\.}$" "$PASSIVE_OUT" 2>/dev/null || echo 0)
-    tier="5k"; [ "$passive_c" -gt 30 ] && tier="20k"; [ "$passive_c" -gt 100 ] && tier="110k"
-    [ -z "$wl" ] || [ ! -f "$wl" ] && continue
-
-    echo -n "  $domain ($tier, passive=$passive_c)... "
-    if [ -f "$PUREDNS" ] && [ -f "$RESOLVERS" ]; then
-        # --resolvers-trusted: use only reliable resolvers for wildcard detection
-        # This prevents 16k unreliable resolvers from causing false wildcard detection
         TRUSTED_ARGS=""
         [ -f "$TRUSTED_RESOLVERS" ] && TRUSTED_ARGS="--resolvers-trusted $TRUSTED_RESOLVERS"
 
-        # Use tee (not >) — tee writes to file via its own handle, bypassing
-        # the Bash tool's stdout interception
-        "$PUREDNS" bruteforce "$wl" "$domain" \
-            -r "$RESOLVERS" $TRUSTED_ARGS \
-            --wildcard-tests 5 -q 2>/dev/null \
-            | tee "$WORKDIR/brute_${domain}.txt" > /dev/null || true
-    elif [ -f "$DNSX" ]; then
-        "$DNSX" -d "$domain" -w "$wl" -silent -t 200 2>/dev/null \
-            | tee "$WORKDIR/brute_${domain}.txt" > /dev/null || true
-    else
-        python3 "$SCRIPTS/brute_force.py" --domain "$domain" \
-            --wordlist "$wl" --output "$WORKDIR/brute_${domain}.txt" --threads 100 || true
-    fi
-    echo "$(wc -l < "$WORKDIR/brute_${domain}.txt" 2>/dev/null || echo 0) found"
+        if [ -f "$PUREDNS" ] && [ -f "$RESOLVERS" ]; then
+            "$PUREDNS" bruteforce "$wl" "$domain" \
+                -r "$RESOLVERS" $TRUSTED_ARGS \
+                --wildcard-tests 5 -q 2>/dev/null \
+                > "$WORKDIR/brute_${domain}.txt" &
+        elif [ -f "$DNSX" ]; then
+            "$DNSX" -d "$domain" -w "$wl" -silent -t 200 2>/dev/null \
+                > "$WORKDIR/brute_${domain}.txt" &
+        else
+            python3 "$SCRIPTS/brute_force.py" --domain "$domain" \
+                --wordlist "$wl" --output "$WORKDIR/brute_${domain}.txt" --threads 100 &
+        fi
+        BRUTE_PID=$!
+        ( sleep 600 && kill -9 $BRUTE_PID 2>/dev/null ) & WATCH_PID=$!
+        wait $BRUTE_PID 2>/dev/null
+        kill -9 $WATCH_PID 2>/dev/null   # cancel watchdog if brute finished cleanly
+        echo "  $domain: $(wc -l < "$WORKDIR/brute_${domain}.txt" 2>/dev/null || echo 0) brute hits"
+    ) &
 done
+wait
 cat "$WORKDIR"/brute_*.txt >> "$BRUTE_OUT" 2>/dev/null || true
 ok "Brute-force total: $(wc -l < "$BRUTE_OUT") subdomains"
 
-# Permutations — alterx generates candidates, resolved through puredns.
-# puredns is wildcard-aware: it keeps real permutation hits and drops catch-all
-# false positives. Plain dnsx is NOT wildcard-aware, so it's only used as a
-# fallback on NON-wildcard domains. This is the NahamSec-style pipeline:
-#   altered names | puredns resolve  (never feed permutations straight to httpx).
-echo "[*] Permutations..."
+# ── Permutations — PARALLEL per domain, per-domain 5-min watchdog ────────────
+# alterx generates candidates, resolved through puredns (wildcard-aware: keeps
+# real permutation hits, drops catch-all false positives). Plain dnsx is NOT
+# wildcard-aware, so it's only a fallback on NON-wildcard domains. Each domain
+# writes its OWN file (no concurrent appends to a shared file), merged after.
+#   altered names | puredns resolve   (never feed permutations straight to httpx)
+echo "[*] Permutations (parallel, per-domain 5-min watchdog) — $(date)"
 for domain in "${DOMAIN_ARR[@]}"; do
     domain=$(echo "$domain" | xargs)
+    (
+        grep -E "(^|\.)${domain//./\\.}$" "$PASSIVE_OUT" 2>/dev/null | head -300 \
+            > "$WORKDIR/known_${domain}.txt" || true
+        if [ ! -s "$WORKDIR/known_${domain}.txt" ]; then exit 0; fi
 
-    grep -E "(^|\.)${domain//./\\.}$" "$PASSIVE_OUT" 2>/dev/null | head -300 \
-        > "$WORKDIR/known_${domain}.txt" || true
-    [ ! -s "$WORKDIR/known_${domain}.txt" ] && continue
+        TRUSTED_ARGS=""
+        [ -f "$TRUSTED_RESOLVERS" ] && TRUSTED_ARGS="--resolvers-trusted $TRUSTED_RESOLVERS"
 
-    TRUSTED_ARGS=""
-    [ -f "$TRUSTED_RESOLVERS" ] && TRUSTED_ARGS="--resolvers-trusted $TRUSTED_RESOLVERS"
-
-    if [ -f "$ALTERX" ] && [ -f "$PUREDNS" ] && [ -f "$RESOLVERS" ]; then
-        # Wildcard-aware resolution — works correctly on wildcard AND normal domains.
-        "$ALTERX" -l "$WORKDIR/known_${domain}.txt" -silent 2>/dev/null \
-            | head -30000 \
-            | "$PUREDNS" resolve -r "$RESOLVERS" $TRUSTED_ARGS \
-                --wildcard-tests 5 -q 2>/dev/null \
-            >> "$PERM_OUT" || true
-    elif ! is_wildcard_domain "$domain" && [ -f "$ALTERX" ] && [ -f "$DNSX" ]; then
-        # dnsx has no wildcard filtering — safe only because this is NOT a wildcard domain.
-        "$ALTERX" -l "$WORKDIR/known_${domain}.txt" -silent 2>/dev/null \
-            | head -30000 \
-            | "$DNSX" -silent -t 150 2>/dev/null \
-            >> "$PERM_OUT" || true
-    elif is_wildcard_domain "$domain"; then
-        echo "  $domain: permutation skipped (wildcard + puredns unavailable for filtering)"
-    else
-        python3 "$SCRIPTS/permutate.py" \
-            --input "$WORKDIR/known_${domain}.txt" \
-            --domain "$domain" \
-            --output "$WORKDIR/perm_${domain}.txt" || true
-        cat "$WORKDIR"/perm_*.txt >> "$PERM_OUT" 2>/dev/null || true
-    fi
+        (
+            if [ -f "$ALTERX" ] && [ -f "$PUREDNS" ] && [ -f "$RESOLVERS" ]; then
+                # Wildcard-aware resolution — correct on wildcard AND normal domains.
+                "$ALTERX" -l "$WORKDIR/known_${domain}.txt" -silent 2>/dev/null \
+                    | head -30000 \
+                    | "$PUREDNS" resolve -r "$RESOLVERS" $TRUSTED_ARGS \
+                        --wildcard-tests 5 -q 2>/dev/null \
+                    > "$WORKDIR/perm_${domain}.txt" || true
+            elif ! is_wildcard_domain "$domain" && [ -f "$ALTERX" ] && [ -f "$DNSX" ]; then
+                # dnsx has no wildcard filtering — safe only because NOT a wildcard domain.
+                "$ALTERX" -l "$WORKDIR/known_${domain}.txt" -silent 2>/dev/null \
+                    | head -30000 \
+                    | "$DNSX" -silent -t 250 2>/dev/null \
+                    > "$WORKDIR/perm_${domain}.txt" || true
+            elif is_wildcard_domain "$domain"; then
+                echo "  $domain: permutation skipped (wildcard + puredns unavailable)"
+            else
+                python3 "$SCRIPTS/permutate.py" \
+                    --input "$WORKDIR/known_${domain}.txt" \
+                    --domain "$domain" \
+                    --output "$WORKDIR/perm_${domain}.txt" || true
+            fi
+        ) &
+        INNER_PID=$!
+        ( sleep 300 && kill -9 $INNER_PID 2>/dev/null ) & WATCH_PID=$!
+        wait $INNER_PID 2>/dev/null
+        kill -9 $WATCH_PID 2>/dev/null
+    ) &
 done
+wait
+cat "$WORKDIR"/perm_*.txt >> "$PERM_OUT" 2>/dev/null || true
 ok "Permutations: $(wc -l < "$PERM_OUT") subdomains"
 
-# ── Phase 4: Deduplicate + persistent cache ───────────────────────────────────
-banner "Phase 4 — Deduplicate"
-MERGED="$WORKDIR/all_unique.txt"
-
-# Persistent cache: accumulates subdomains across ALL runs for this org.
-# Passive APIs have rate limits — results vary run to run. The cache ensures
-# a subdomain found in ANY run is never lost in future runs.
-CACHE_DIR="$HOME/.recon-cache"
-mkdir -p "$CACHE_DIR"
-ORG_SLUG=$(echo "$ORG" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '_')
-CACHE_FILE="$CACHE_DIR/${ORG_SLUG}_subdomains.txt"
-[ -f "$CACHE_FILE" ] && ok "Cache: $(wc -l < "$CACHE_FILE") previously found subdomains"
-
-# Self-heal a poisoned cache. If any domain has wildcard DNS, re-validate the
-# cached entries through puredns BEFORE merging them, so stale wildcard false
-# positives (e.g. left by an older/buggy run or another tool) can't silently
-# inflate this run. puredns keeps only entries that genuinely resolve and aren't
-# catch-all wildcards. Only runs for wildcard domains, so normal caches (which
-# may legitimately hold currently-dead historical subs) are left untouched.
-if [ -f "$CACHE_FILE" ] && [ "${#WILDCARD_DOMAINS[@]}" -gt 0 ] && [ -f "$PUREDNS" ] && [ -f "$RESOLVERS" ]; then
-    _ct=""; [ -f "$TRUSTED_RESOLVERS" ] && _ct="--resolvers-trusted $TRUSTED_RESOLVERS"
-    _before=$(wc -l < "$CACHE_FILE" | xargs)
-    if "$PUREDNS" resolve "$CACHE_FILE" -r "$RESOLVERS" $_ct --wildcard-tests 5 -q \
-            2>/dev/null > "$CACHE_FILE.clean"; then
-        mv "$CACHE_FILE.clean" "$CACHE_FILE"
-        warn "cache re-validated through puredns (wildcard filter): $_before → $(wc -l < "$CACHE_FILE" | xargs)"
-    else
-        rm -f "$CACHE_FILE.clean"
-    fi
+# ── tlsx SAN-on-CIDR — highest-yield active technique per the research report ──
+# For each owned root: resolve ASN → announced CIDRs → pull cert SANs/CNs across
+# the range → resolve. Fans out across ALL roots in parallel (per-domain files,
+# merged after). Skips cleanly when asnmap/tlsx aren't installed.
+if [ -x "$TOOLS_DIR/bin/asnmap" ] && [ -x "$TOOLS_DIR/bin/tlsx" ]; then
+    echo "[*] tlsx CIDR-SAN (parallel per domain) — $(date)"
+    for domain in "${DOMAIN_ARR[@]}"; do
+        domain=$(echo "$domain" | xargs)
+        (
+            "$TOOLS_DIR/bin/asnmap" -d "$domain" -silent 2>/dev/null \
+                | "$TOOLS_DIR/bin/mapcidr" -silent 2>/dev/null \
+                | "$TOOLS_DIR/bin/tlsx" -san -cn -silent -resp-only 2>/dev/null \
+                | "$DNSX" -silent 2>/dev/null \
+                > "$WORKDIR/tls_san_${domain}.txt" || true
+        ) &
+    done
+    wait
+    cat "$WORKDIR"/tls_san_*.txt >> "$TLS_OUT" 2>/dev/null || true
+    ok "tlsx CIDR-SAN: $(wc -l < "$TLS_OUT") subdomains"
+else
+    info "tlsx CIDR-SAN skipped (asnmap/tlsx not installed)"
 fi
 
-# Build the source list — include the cache ONLY if it exists. Passing a
-# nonexistent cache path to `cat` makes it exit 1, which under `set -o pipefail`
-# aborted the whole run on the very first scan of any org (no cache yet).
-MERGE_SRCS=("$PASSIVE_OUT" "$ADVANCED_OUT" "$BRUTE_OUT" "$PERM_OUT" "$ZONE_OUT")
-[ -f "$CACHE_FILE" ] && MERGE_SRCS+=("$CACHE_FILE")
-# `|| true`: an empty result set makes `grep` exit 1 — that's not a failure here.
-cat "${MERGE_SRCS[@]}" 2>/dev/null \
+# ── Phase 5: Merge + cache (cache is HISTORICAL ONLY, never merged into output) ─
+banner "Phase 5 — Merge + Cache"
+MERGED="$WORKDIR/all_unique.txt"
+
+# Strip ANSI escape sequences some tools (bbot/katana) leak when their stdout is
+# captured into a pipe — otherwise "\x1b[36mwww.example.com" becomes
+# "36mwww.example.com" in the report.
+ANSI='s/\x1b\[[0-9;]*[a-zA-Z]//g'
+# Canonical result = what enumeration found THIS run. The persistent cache is a
+# SEPARATE historical record and is deliberately NOT merged in here — blind
+# cache-merge was the source of long-decommissioned subdomains reappearing in
+# every report.
+cat "$PASSIVE_OUT" "$ADVANCED_OUT" "$BRUTE_OUT" "$PERM_OUT" "$TLS_OUT" "$ZONE_OUT" 2>/dev/null \
+    | sed -E "$ANSI" \
     | grep -v "^#\|^\*\.\|^$" \
     | tr '[:upper:]' '[:lower:]' \
     | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/\.+$//' \
@@ -398,9 +526,19 @@ cat "${MERGE_SRCS[@]}" 2>/dev/null \
 [ -f "$MERGED" ] || : > "$MERGED"
 TOTAL=$(wc -l < "$MERGED" | xargs)
 
-# Update cache with everything found this run + all previous runs
-cp "$MERGED" "$CACHE_FILE"
-ok "Total unique: $TOTAL (cache updated: $CACHE_FILE)"
+# Persistent cache — union of historical + this-run, tagged with a first-seen
+# date so a future run can age out anything not seen in N consecutive scans.
+# Used for delta detection only; never blindly merged into the result above.
+CACHE_DIR="$HOME/.recon-cache"
+mkdir -p "$CACHE_DIR"
+CACHE_SLUG=$(echo "$ORG" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '_')
+CACHE_FILE="$CACHE_DIR/${CACHE_SLUG}_subdomains.txt"
+{
+    date_iso=$(date -u +%Y-%m-%d)
+    awk -v d="$date_iso" '{print $0"\t"d}' "$MERGED"
+    [ -f "$CACHE_FILE" ] && cat "$CACHE_FILE"
+} | awk '!seen[$1]++' > "$CACHE_FILE.new" 2>/dev/null && mv "$CACHE_FILE.new" "$CACHE_FILE" || true
+ok "Total unique this run: $TOTAL  |  cache: $(wc -l < "$CACHE_FILE" 2>/dev/null | xargs || echo 0)"
 
 echo ""
 for domain in "${DOMAIN_ARR[@]}"; do
@@ -413,14 +551,14 @@ for domain in "${DOMAIN_ARR[@]}"; do
     fi
 done
 
-# ── Phase 5: Live probe ───────────────────────────────────────────────────────
-banner "Phase 5 — Live Probe"
+# ── Phase 6: Live probe ───────────────────────────────────────────────────────
+banner "Phase 6 — Live Probe"
 LIVE_OUT="$WORKDIR/live.txt"
 LIVE_COUNT=0
 if [ -f "$HTTPX" ]; then
     # Use probe_live.py — Python subprocess.Popen bypasses the Bash tool's
     # stream interception that causes httpx output to disappear.
-    # NON-FATAL: the live probe must never abort the run, or the report (Phase 6)
+    # NON-FATAL: the live probe must never abort the run, or the report (Phase 7)
     # would be lost even though all subdomains were already gathered.
     if python3 "$SCRIPTS/probe_live.py" \
         --input "$MERGED" --output "$LIVE_OUT" \
@@ -434,8 +572,8 @@ else
     warn "httpx not at $HTTPX — skipping live probe"
 fi
 
-# ── Phase 6: Write report ─────────────────────────────────────────────────────
-banner "Phase 6 — Report → $OUTPUT"
+# ── Phase 7: Write report ─────────────────────────────────────────────────────
+banner "Phase 7 — Report → $OUTPUT"
 DOMAIN_MAP=""
 for domain in "${DOMAIN_ARR[@]}"; do
     domain=$(echo "$domain" | xargs)
@@ -443,11 +581,17 @@ for domain in "${DOMAIN_ARR[@]}"; do
 done
 DOMAIN_MAP="${DOMAIN_MAP%,}"
 
-python3 "$SCRIPTS/write_report.py" \
-    --org "$ORG" \
-    --domain-map "$DOMAIN_MAP" \
-    --subdomain-files "$MERGED" \
-    --output "$OUTPUT"
+# Include the rejected-roots file in org mode (validate_ownership wrote it) so
+# the report shows what was excluded and why.
+if [ -n "${REJECTED:-}" ] && [ -f "${REJECTED:-}" ]; then
+    python3 "$SCRIPTS/write_report.py" \
+        --org "$ORG" --domain-map "$DOMAIN_MAP" \
+        --subdomain-files "$MERGED" --rejected-file "$REJECTED" --output "$OUTPUT"
+else
+    python3 "$SCRIPTS/write_report.py" \
+        --org "$ORG" --domain-map "$DOMAIN_MAP" \
+        --subdomain-files "$MERGED" --output "$OUTPUT"
+fi
 
 if [ -f "$LIVE_OUT" ] && [ -s "$LIVE_OUT" ]; then
     { echo ""; echo "# LIVE HOSTS ($LIVE_COUNT)"; cat "$LIVE_OUT"; } >> "$OUTPUT"
@@ -455,11 +599,15 @@ fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 banner "Complete"
+echo -e "  Mode:       ${CYAN}$MODE${NC}"
 echo -e "  Org:        ${CYAN}$ORG${NC}"
+echo -e "  Roots:      ${CYAN}$DOMAINS${NC}"
 echo -e "  Subdomains: ${CYAN}$TOTAL${NC}"
 echo -e "  Live:       ${CYAN}$LIVE_COUNT${NC}"
-echo -e "  Report:     ${GREEN}$OUTPUT${NC}"
-echo -e "  Log:        ${GREEN}$LOG${NC}"
 echo ""
-echo -e "  ${GREEN}✔ Report and full log saved in: $RUNDIR${NC}"
+echo -e "  ${GREEN}✔ Output dir:${NC} $RUNDIR"
+echo -e "  ${CYAN}Main outputs:${NC}"
+echo -e "     • $(basename "$OUTPUT")  — the report (subdomains grouped by root + live hosts)"
+echo -e "     • run.log  — full run log (every phase + tool)"
+echo -e "  Everything else in the dir (work/, owned_roots.txt, rejected_domains.txt) is supporting/debug output."
 echo ""

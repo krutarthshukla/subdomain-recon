@@ -3,7 +3,9 @@
 # Extends v1 installer with: uncover, asnmap, cdncheck, shuffledns, bbot,
 #   badDNS, subwiz, sourcemapper, mmh3, pyyaml, bbot presets
 
-set -euo pipefail
+# NOT -e: best-effort installer — a single failing tool/step must not abort the
+# whole toolchain (each step guards itself with || warn).
+set -uo pipefail
 
 TOOLS_DIR="$HOME/.recon-tools"
 GOBIN="$TOOLS_DIR/bin"
@@ -361,6 +363,49 @@ hostio: ""
 EOF
     ok "API keys template: $CONFIG_DIR/api_keys.yaml"
 fi
+
+# Curated acquisitions/subsidiaries hint (optional). Free OSINT can't reliably
+# auto-discover an org's differently-branded subsidiaries/acquisitions — list the
+# known ones here and run_all.sh org-mode folds them in. Ships empty; never
+# overwrites an existing file.
+if [ ! -f "$CONFIG_DIR/acquisitions.yaml" ]; then
+    cat > "$CONFIG_DIR/acquisitions.yaml" << 'EOF'
+# subdomain-recon — curated acquisitions / subsidiaries hint (optional).
+# Per org, matched by slug (case/space-insensitive). run_all.sh org-mode loads it:
+#   domains: pass through as trusted-owned + enumeration candidates
+#   names:   extend the slug-sweep and --org-aliases (so subdomains validate too)
+#
+# Example:
+# Acme:
+#   domains: [acme.com, acme.io, acquired-brand.com]
+#   names:   [Acme, AcquiredBrand]
+EOF
+    ok "acquisitions hint template: $CONFIG_DIR/acquisitions.yaml"
+fi
+
+# ── Write activate.sh ──────────────────────────────────────────────────────────
+# The SKILL.md asks the user to `source ~/.recon-tools/activate.sh` in Phase 0,
+# so we have to actually create it. Earlier installs only wrote PATH into
+# rc files (~/.zshrc, ~/.bashrc), leaving activate.sh missing — every fresh
+# session that didn't auto-source the rc file ran with the wrong PATH and
+# every PD tool resolved to a pyenv shim. Writing this file makes the
+# activation step a no-op success instead of a no-op failure.
+cat > "$HOME/.recon-tools/activate.sh" <<'EOF'
+# Source from a shell to put recon tools on PATH for this session.
+# Idempotent: re-sourcing is harmless.
+export RECON_TOOLS="$HOME/.recon-tools"
+case ":$PATH:" in
+  *":$RECON_TOOLS/bin:"*) ;;
+  *) export PATH="$RECON_TOOLS/bin:$PATH" ;;
+esac
+export GOBIN="$RECON_TOOLS/bin"
+
+# Refuse pyenv-shim fallback for PD tools whose Python packages collide on
+# name. If a fresh session previously activated pyenv before activate.sh,
+# `command -v httpx` would resolve to the Python httpx CLI — totally
+# different binary, breaks every script. Re-prepending here wins.
+EOF
+ok "activate.sh: $HOME/.recon-tools/activate.sh"
 
 # ── Summary ────────────────────────────────────────────────────────────────────
 echo ""
